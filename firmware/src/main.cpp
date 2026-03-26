@@ -270,26 +270,11 @@ static bool isDuplicate(uint8_t vid, uint16_t pid)
 // EMERGENCY_CHANNELS[].  Bypasses CSMA — emergencies always pre-empt.
 static void sendEmergencyMultiChannel(const EmergencyPacket &pkt)
 {
-    Serial.print("[TX-EMRG] Multi-channel broadcast: vID=");
-    Serial.print(pkt.vehicleID);
-    Serial.print(" pktID=");
-    Serial.print(pkt.packetID);
-    Serial.print(" event=");
-    Serial.print(pkt.eventCode);
-    Serial.print(" lat=");
-    Serial.print(pkt.latitude, 6);
-    Serial.print(" lon=");
-    Serial.println(pkt.longitude, 6);
-
     for (uint8_t ch = 0; ch < NUM_EMERGENCY_CHANNELS; ch++)
     {
         radio.stopListening();
         radio.setChannel(EMERGENCY_CHANNELS[ch]);
         bool ok = radio.write(&pkt, sizeof(pkt));
-        Serial.print("  [TX-EMRG] ch=");
-        Serial.print(EMERGENCY_CHANNELS[ch]);
-        Serial.print(" result=");
-        Serial.println(ok ? "OK" : "FAIL");
         if (ch < NUM_EMERGENCY_CHANNELS - 1)
             delayMicroseconds(EMERGENCY_HOP_GAP_US); // tiny gap between hops
     }
@@ -548,7 +533,6 @@ void taskGPS(void *pvParameters)
 {
     (void)pvParameters;
     gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    Serial.println("[GPS] UART2 started at 9600 baud");
 
     static uint32_t lastGpsLog = 0;
 
@@ -573,26 +557,12 @@ void taskGPS(void *pvParameters)
                 spdUpdated = true;
             }
 
-            // Log every GPS fix (throttled to every 2s to avoid flood)
+            // Update GPS fix count (no logging to serial)
             uint32_t now = millis();
             if (now - lastGpsLog >= 2000)
             {
                 lastGpsLog = now;
                 dbgGpsFixCount++;
-                Serial.print("[GPS] fix#");
-                Serial.print(dbgGpsFixCount);
-                Serial.print(" loc=");
-                Serial.print(gpsFix.valid.location ? "YES" : "NO");
-                Serial.print(" spd=");
-                Serial.print(gpsFix.valid.speed ? "YES" : "NO");
-                Serial.print(" | lat=");
-                Serial.print(ownLat, 6);
-                Serial.print(" lon=");
-                Serial.print(ownLon, 6);
-                Serial.print(" speed=");
-                Serial.print(ownSpeed / 10.0f, 1);
-                Serial.print("km/h sats=");
-                Serial.println(gpsFix.valid.satellites ? gpsFix.satellites : 0);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(10)); // yield — not a blocking delay
@@ -628,28 +598,16 @@ void taskSerialListener(void *pvParameters)
             {
                 lineBuf[lineIdx] = '\0';
 
-                // Log every received command
-                if (lineIdx > 0)
-                {
-                    Serial.print("[CMD] Serial received: \"");
-                    Serial.print(lineBuf);
-                    Serial.print("\" (len=");
-                    Serial.print(lineIdx);
-                    Serial.println(")");
-                }
-
                 // ── Check for DRIVER_OK (driver confirmed conscious) ──
                 if (lineIdx > 0 && strstr(lineBuf, "DRIVER_OK") != nullptr)
                 {
                     driverOkFlag = true;     // cancels incap timer / SOS
                     drowsyCancelFlag = true; // also cancels any drowsy wake-up
-                    Serial.println("[CMD] → DRIVER_OK matched: driverOkFlag=true, drowsyCancelFlag=true");
                 }
                 // ── Check for CANCEL_DROWSY (driver confirmed awake) ──
                 else if (lineIdx > 0 && strstr(lineBuf, "CANCEL_DROWSY") != nullptr)
                 {
                     drowsyCancelFlag = true;
-                    Serial.println("[CMD] → CANCEL_DROWSY matched: drowsyCancelFlag=true");
                 }
                 // ── Check for DROWSY_ALERT ──
                 else if (lineIdx > 0 && strstr(lineBuf, "DROWSY_ALERT") != nullptr)
@@ -665,16 +623,7 @@ void taskSerialListener(void *pvParameters)
                         // Turn on buzzer + red LED for first (gentlest) stage
                         digitalWrite(BUZZER_PIN, HIGH);
                         digitalWrite(LED_RED_PIN, HIGH);
-                        Serial.println("[CMD] → DROWSY_ALERT matched: starting wake-up (stage 1/3)");
                     }
-                    else
-                    {
-                        Serial.println("[CMD] → DROWSY_ALERT ignored (cooldown active)");
-                    }
-                }
-                else if (lineIdx > 0)
-                {
-                    Serial.println("[CMD] → No matching command");
                 }
                 lineIdx = 0;
             }
@@ -717,7 +666,6 @@ void taskRFTransmit(void *pvParameters)
             pkt.latitude = ownLat;
             pkt.longitude = ownLon;
 
-            Serial.println("[TX] >>> EMERGENCY DROWSY — bypassing CSMA");
             // Transmit across all emergency channels (no carrier check)
             sendEmergencyMultiChannel(pkt);
 
@@ -739,7 +687,6 @@ void taskRFTransmit(void *pvParameters)
             pkt.latitude = ownLat;
             pkt.longitude = ownLon;
 
-            Serial.println("[TX] >>> EMERGENCY COLLISION — bypassing CSMA");
             // Transmit across all emergency channels (no carrier check)
             sendEmergencyMultiChannel(pkt);
 
@@ -758,9 +705,6 @@ void taskRFTransmit(void *pvParameters)
             // ── CSMA: check if in backoff ──
             if (now < csmaBackoffUntil)
             {
-                Serial.print("[CSMA] In backoff, ");
-                Serial.print(csmaBackoffUntil - now);
-                Serial.println("ms remaining");
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
@@ -786,35 +730,12 @@ void taskRFTransmit(void *pvParameters)
                 bool ok = radio.write(&pkt, sizeof(pkt));
                 radio.startListening();
                 dbgTxNormalCount++;
-
-                Serial.print("[TX] Normal #");
-                Serial.print(dbgTxNormalCount);
-                Serial.print(" pktID=");
-                Serial.print(pkt.packetID);
-                Serial.print(" lat=");
-                Serial.print(pkt.latitude, 6);
-                Serial.print(" lon=");
-                Serial.print(pkt.longitude, 6);
-                Serial.print(" spd=");
-                Serial.print(pkt.speed / 10.0f, 1);
-                Serial.print("km/h turn=");
-                Serial.print(pkt.turnIndicator);
-                Serial.print(" jitter=");
-                Serial.print(txJitter);
-                Serial.print("ms result=");
-                Serial.println(ok ? "OK" : "FAIL");
             }
             else
             {
                 // Channel busy — exponential backoff
                 dbgCsmaBusyCount++;
                 csmaBackoffAttempt++;
-                Serial.print("[CSMA] Channel BUSY (total=");
-                Serial.print(dbgCsmaBusyCount);
-                Serial.print(") attempt=");
-                Serial.print(csmaBackoffAttempt);
-                Serial.print("/");
-                Serial.println(CSMA_MAX_BACKOFF_TRIES);
 
                 if (csmaBackoffAttempt >= CSMA_MAX_BACKOFF_TRIES)
                 {
@@ -822,16 +743,12 @@ void taskRFTransmit(void *pvParameters)
                     lastTx = now;
                     txJitter = random(0, TX_JITTER_MAX_MS);
                     csmaBackoffAttempt = 0;
-                    Serial.println("[CSMA] Max retries — skipping TX cycle");
                 }
                 else
                 {
                     // backoff = random(1..10) * attempt  (in ms)
                     uint32_t bo = (uint32_t)random(1, 11) * csmaBackoffAttempt;
                     csmaBackoffUntil = now + bo;
-                    Serial.print("[CSMA] Backoff ");
-                    Serial.print(bo);
-                    Serial.println("ms");
                 }
             }
         }

@@ -22,6 +22,7 @@ Usage:
 import argparse
 import time
 import sys
+import threading
 
 import cv2
 import dlib
@@ -111,36 +112,72 @@ def select_driver_face(faces, frame_width):
 # ─────────────────────── Serial Wrapper ───────────────────────────────────────
 class SerialBridge:
     """
-    Wraps pyserial to send DROWSY_ALERT to the ESP32.
+    Wraps pyserial to send commands to ESP32 and read back all debug output.
+    A background thread continuously reads ESP32 serial output and prints it
+    so you can see every value (GPS, TX, RX, CSMA, RISK, etc.) in one terminal.
     If ``--no-serial`` is passed, operates in dry-run mode (console only).
     """
 
     def __init__(self, port: str | None, baud: int, dry_run: bool = False):
         self.dry_run = dry_run
         self.ser = None
+        self._reader_thread = None
+        self._running = False
 
         if not dry_run and port:
             try:
                 import serial
-                self.ser = serial.Serial(port, baud, timeout=1)
+                self.ser = serial.Serial(port, baud, timeout=0.1)
                 time.sleep(2)  # wait for ESP32 to reboot on serial connect
                 print(f"[SERIAL] Connected to {port} @ {baud} baud")
+                # Start background reader thread
+                self._running = True
+                self._reader_thread = threading.Thread(
+                    target=self._read_loop, daemon=True
+                )
+                self._reader_thread.start()
             except Exception as e:
                 print(f"[SERIAL] ERROR: Could not open {port}: {e}")
                 print("[SERIAL] Falling back to dry-run mode.")
                 self.dry_run = True
 
-    def send_alert(self):
-        """Send DROWSY_ALERT to the ESP32 (or print to console in dry-run)."""
-        msg = "DROWSY_ALERT\n"
+    def _read_loop(self):
+        """Background thread: continuously reads and prints ESP32 serial output."""
+        while self._running and self.ser and self.ser.is_open:
+            try:
+                if self.ser.in_waiting > 0:
+                    line = self.ser.readline().decode("utf-8", errors="replace").rstrip()
+                    if line:
+                        print(f"[ESP32] {line}")
+            except Exception:
+                pass  # port closed or read error — silently continue
+
+    def send(self, message: str):
+        """Send a raw string to the ESP32 (with newline appended)."""
+        msg = message + "\n"
         if self.dry_run or self.ser is None:
-            print(f"[DRY-RUN] Would send: {msg.strip()}")
+            print(f"[DRY-RUN] Would send: {message}")
         else:
             self.ser.write(msg.encode("utf-8"))
             self.ser.flush()
-            print(f"[SERIAL] Sent: {msg.strip()}")
+            print(f"[SERIAL] Sent: {message}")
+
+    def send_alert(self):
+        """Send DROWSY_ALERT to the ESP32."""
+        self.send("DROWSY_ALERT")
+
+    def send_cancel(self):
+        """Send CANCEL_DROWSY to the ESP32."""
+        self.send("CANCEL_DROWSY")
+
+    def send_driver_ok(self):
+        """Send DRIVER_OK to the ESP32 (cancels incap timer / SOS)."""
+        self.send("DRIVER_OK")
 
     def close(self):
+        self._running = False
+        if self._reader_thread:
+            self._reader_thread.join(timeout=1.0)
         if self.ser and self.ser.is_open:
             self.ser.close()
 
@@ -232,7 +269,12 @@ def main():
     head_down_alert_sent = False          # avoid repeating while head is still down
 
     print("[INIT] Drowsiness detector running. Press 'q' to quit.")
-    print("[INIT] Driver = rightmost-closest face to the dashcam.\n")
+    print("[INIT] Driver = rightmost-closest face to the dashcam.")
+    print("[INIT] Keyboard: 'q'=quit  'o'=DRIVER_OK  'c'=CANCEL_DROWSY")
+    if not bridge.dry_run:
+        print("[INIT] ESP32 output will appear with [ESP32] prefix.\n")
+    else:
+        print("")
 
     try:
         while True:
@@ -385,9 +427,14 @@ def main():
 
             cv2.imshow("V2V Drowsiness Detector", frame)
 
-            # Quit on 'q'
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            # Quit on 'q', send DRIVER_OK on 'o', CANCEL_DROWSY on 'c'
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
+            elif key == ord("o"):
+                bridge.send_driver_ok()
+            elif key == ord("c"):
+                bridge.send_cancel()
 
     except KeyboardInterrupt:
         print("\n[EXIT] Interrupted by user.")
