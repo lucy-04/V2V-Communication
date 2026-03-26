@@ -12,6 +12,10 @@
  *   • NO delay()  — millis()-based non-blocking timers only
  *   • Packed structs ≤ 32 bytes (NRF24L01 hard limit)
  *   • Circular ring buffer for inbound RF packets
+ *
+ * Debug mode
+ *   • All values printed to Serial for hardware validation
+ *   • Prefix tags: [GPS] [TX] [RX] [CSMA] [RISK] [SOS] [DROWSY] [CMD] [SYS]
  ******************************************************************************/
 
 #include <Arduino.h>
@@ -157,6 +161,15 @@ static volatile float ownLon = 0.0f;
 static volatile uint16_t ownSpeed = 0; // km/h × 10
 static volatile uint8_t ownTurn = 0;   // 0=straight
 
+// ─── Debug counters ────────────────────────────────────────────────────────
+static volatile uint32_t dbgTxNormalCount = 0;    // total normal packets sent
+static volatile uint32_t dbgTxEmergencyCount = 0; // total emergency packets sent
+static volatile uint32_t dbgRxRawCount = 0;       // total raw packets received
+static volatile uint32_t dbgRxDupCount = 0;       // duplicates suppressed
+static volatile uint32_t dbgRxOwnCount = 0;       // own packets filtered
+static volatile uint32_t dbgCsmaBusyCount = 0;    // CSMA channel-busy events
+static volatile uint32_t dbgGpsFixCount = 0;      // GPS fix updates
+
 // ─── Packet identification ─────────────────────────────────────────────────
 static uint8_t myVehicleID = 0; // derived from ESP32 MAC at boot
 static uint16_t txPacketID = 0; // auto-incrementing per TX
@@ -257,14 +270,30 @@ static bool isDuplicate(uint8_t vid, uint16_t pid)
 // EMERGENCY_CHANNELS[].  Bypasses CSMA — emergencies always pre-empt.
 static void sendEmergencyMultiChannel(const EmergencyPacket &pkt)
 {
+    Serial.print("[TX-EMRG] Multi-channel broadcast: vID=");
+    Serial.print(pkt.vehicleID);
+    Serial.print(" pktID=");
+    Serial.print(pkt.packetID);
+    Serial.print(" event=");
+    Serial.print(pkt.eventCode);
+    Serial.print(" lat=");
+    Serial.print(pkt.latitude, 6);
+    Serial.print(" lon=");
+    Serial.println(pkt.longitude, 6);
+
     for (uint8_t ch = 0; ch < NUM_EMERGENCY_CHANNELS; ch++)
     {
         radio.stopListening();
         radio.setChannel(EMERGENCY_CHANNELS[ch]);
-        radio.write(&pkt, sizeof(pkt));
+        bool ok = radio.write(&pkt, sizeof(pkt));
+        Serial.print("  [TX-EMRG] ch=");
+        Serial.print(EMERGENCY_CHANNELS[ch]);
+        Serial.print(" result=");
+        Serial.println(ok ? "OK" : "FAIL");
         if (ch < NUM_EMERGENCY_CHANNELS - 1)
             delayMicroseconds(EMERGENCY_HOP_GAP_US); // tiny gap between hops
     }
+    dbgTxEmergencyCount++;
     // Return to normal channel + RX mode
     radio.setChannel(RF_CHANNEL);
     radio.startListening();
@@ -519,21 +548,51 @@ void taskGPS(void *pvParameters)
 {
     (void)pvParameters;
     gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    Serial.println("[GPS] UART2 started at 9600 baud");
+
+    static uint32_t lastGpsLog = 0;
 
     for (;;)
     {
         while (gpsParser.available(gpsSerial))
         {
             gpsFix = gpsParser.read();
+            bool locUpdated = false;
+            bool spdUpdated = false;
+
             if (gpsFix.valid.location)
             {
                 ownLat = gpsFix.latitude();
                 ownLon = gpsFix.longitude();
+                locUpdated = true;
             }
             if (gpsFix.valid.speed)
             {
                 // NeoGPS gives speed in km/h as float; store × 10 for 0.1 res
                 ownSpeed = (uint16_t)(gpsFix.speed_kph() * 10.0f);
+                spdUpdated = true;
+            }
+
+            // Log every GPS fix (throttled to every 2s to avoid flood)
+            uint32_t now = millis();
+            if (now - lastGpsLog >= 2000)
+            {
+                lastGpsLog = now;
+                dbgGpsFixCount++;
+                Serial.print("[GPS] fix#");
+                Serial.print(dbgGpsFixCount);
+                Serial.print(" loc=");
+                Serial.print(gpsFix.valid.location ? "YES" : "NO");
+                Serial.print(" spd=");
+                Serial.print(gpsFix.valid.speed ? "YES" : "NO");
+                Serial.print(" | lat=");
+                Serial.print(ownLat, 6);
+                Serial.print(" lon=");
+                Serial.print(ownLon, 6);
+                Serial.print(" speed=");
+                Serial.print(ownSpeed / 10.0f, 1);
+                Serial.print("km/h sats=");
+                Serial.println(gpsFix.valid.satellites ? gpsFix.satellites : 0);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(10)); // yield — not a blocking delay
@@ -569,16 +628,28 @@ void taskSerialListener(void *pvParameters)
             {
                 lineBuf[lineIdx] = '\0';
 
+                // Log every received command
+                if (lineIdx > 0)
+                {
+                    Serial.print("[CMD] Serial received: \"");
+                    Serial.print(lineBuf);
+                    Serial.print("\" (len=");
+                    Serial.print(lineIdx);
+                    Serial.println(")");
+                }
+
                 // ── Check for DRIVER_OK (driver confirmed conscious) ──
                 if (lineIdx > 0 && strstr(lineBuf, "DRIVER_OK") != nullptr)
                 {
                     driverOkFlag = true;     // cancels incap timer / SOS
                     drowsyCancelFlag = true; // also cancels any drowsy wake-up
+                    Serial.println("[CMD] → DRIVER_OK matched: driverOkFlag=true, drowsyCancelFlag=true");
                 }
                 // ── Check for CANCEL_DROWSY (driver confirmed awake) ──
                 else if (lineIdx > 0 && strstr(lineBuf, "CANCEL_DROWSY") != nullptr)
                 {
                     drowsyCancelFlag = true;
+                    Serial.println("[CMD] → CANCEL_DROWSY matched: drowsyCancelFlag=true");
                 }
                 // ── Check for DROWSY_ALERT ──
                 else if (lineIdx > 0 && strstr(lineBuf, "DROWSY_ALERT") != nullptr)
@@ -594,8 +665,16 @@ void taskSerialListener(void *pvParameters)
                         // Turn on buzzer + red LED for first (gentlest) stage
                         digitalWrite(BUZZER_PIN, HIGH);
                         digitalWrite(LED_RED_PIN, HIGH);
-                        Serial.println("[V2V] DROWSY_ALERT received — starting wake-up sequence (stage 1/3)");
+                        Serial.println("[CMD] → DROWSY_ALERT matched: starting wake-up (stage 1/3)");
                     }
+                    else
+                    {
+                        Serial.println("[CMD] → DROWSY_ALERT ignored (cooldown active)");
+                    }
+                }
+                else if (lineIdx > 0)
+                {
+                    Serial.println("[CMD] → No matching command");
                 }
                 lineIdx = 0;
             }
@@ -638,6 +717,7 @@ void taskRFTransmit(void *pvParameters)
             pkt.latitude = ownLat;
             pkt.longitude = ownLon;
 
+            Serial.println("[TX] >>> EMERGENCY DROWSY — bypassing CSMA");
             // Transmit across all emergency channels (no carrier check)
             sendEmergencyMultiChannel(pkt);
 
@@ -659,6 +739,7 @@ void taskRFTransmit(void *pvParameters)
             pkt.latitude = ownLat;
             pkt.longitude = ownLon;
 
+            Serial.println("[TX] >>> EMERGENCY COLLISION — bypassing CSMA");
             // Transmit across all emergency channels (no carrier check)
             sendEmergencyMultiChannel(pkt);
 
@@ -677,7 +758,9 @@ void taskRFTransmit(void *pvParameters)
             // ── CSMA: check if in backoff ──
             if (now < csmaBackoffUntil)
             {
-                // Still in backoff window — skip this cycle
+                Serial.print("[CSMA] In backoff, ");
+                Serial.print(csmaBackoffUntil - now);
+                Serial.println("ms remaining");
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
@@ -700,25 +783,55 @@ void taskRFTransmit(void *pvParameters)
                 pkt.turnIndicator = ownTurn;
 
                 radio.stopListening();
-                radio.write(&pkt, sizeof(pkt));
+                bool ok = radio.write(&pkt, sizeof(pkt));
                 radio.startListening();
+                dbgTxNormalCount++;
+
+                Serial.print("[TX] Normal #");
+                Serial.print(dbgTxNormalCount);
+                Serial.print(" pktID=");
+                Serial.print(pkt.packetID);
+                Serial.print(" lat=");
+                Serial.print(pkt.latitude, 6);
+                Serial.print(" lon=");
+                Serial.print(pkt.longitude, 6);
+                Serial.print(" spd=");
+                Serial.print(pkt.speed / 10.0f, 1);
+                Serial.print("km/h turn=");
+                Serial.print(pkt.turnIndicator);
+                Serial.print(" jitter=");
+                Serial.print(txJitter);
+                Serial.print("ms result=");
+                Serial.println(ok ? "OK" : "FAIL");
             }
             else
             {
                 // Channel busy — exponential backoff
+                dbgCsmaBusyCount++;
                 csmaBackoffAttempt++;
+                Serial.print("[CSMA] Channel BUSY (total=");
+                Serial.print(dbgCsmaBusyCount);
+                Serial.print(") attempt=");
+                Serial.print(csmaBackoffAttempt);
+                Serial.print("/");
+                Serial.println(CSMA_MAX_BACKOFF_TRIES);
+
                 if (csmaBackoffAttempt >= CSMA_MAX_BACKOFF_TRIES)
                 {
                     // Give up — skip this TX cycle, reset for next
                     lastTx = now;
                     txJitter = random(0, TX_JITTER_MAX_MS);
                     csmaBackoffAttempt = 0;
+                    Serial.println("[CSMA] Max retries — skipping TX cycle");
                 }
                 else
                 {
                     // backoff = random(1..10) * attempt  (in ms)
                     uint32_t bo = (uint32_t)random(1, 11) * csmaBackoffAttempt;
                     csmaBackoffUntil = now + bo;
+                    Serial.print("[CSMA] Backoff ");
+                    Serial.print(bo);
+                    Serial.println("ms");
                 }
             }
         }
@@ -747,6 +860,18 @@ void taskRFReceive(void *pvParameters)
             RawPacket pkt;
             radio.read(&pkt.data, sizeof(pkt.data));
             rxRingBuffer.push(pkt);
+            dbgRxRawCount++;
+
+            uint8_t pType = pkt.data[0];
+            uint8_t curCh = onHomeChannel ? RF_CHANNEL : EMERGENCY_CHANNELS[rxChIdx];
+            Serial.print("[RX] Raw packet on ch=");
+            Serial.print(curCh);
+            Serial.print(" type=");
+            Serial.print(pType);
+            Serial.print(" rxTotal=");
+            Serial.print(dbgRxRawCount);
+            Serial.print(" bufUsed=");
+            Serial.println(rxRingBuffer.count());
         }
 
         // ── Channel hopping for emergency reception ──
@@ -815,11 +940,21 @@ void taskRiskAssessment(void *pvParameters)
 
                 // Ignore our own packets
                 if (pkt.vehicleID == myVehicleID)
+                {
+                    dbgRxOwnCount++;
                     continue;
+                }
 
                 // Duplicate suppression
                 if (isDuplicate(pkt.vehicleID, pkt.packetID))
+                {
+                    dbgRxDupCount++;
+                    Serial.print("[RISK] Duplicate normal pkt suppressed: vID=");
+                    Serial.print(pkt.vehicleID);
+                    Serial.print(" pktID=");
+                    Serial.println(pkt.packetID);
                     continue;
+                }
 
                 float dist = approxDistanceM(ownLat, ownLon, pkt.latitude, pkt.longitude);
 
@@ -836,12 +971,33 @@ void taskRiskAssessment(void *pvParameters)
 
                 float ttc = computeTTC(dist, closingSpeedMs);
 
+                // Log every received normal packet with full detail
+                Serial.print("[RISK] Normal from vID=");
+                Serial.print(pkt.vehicleID);
+                Serial.print(" pktID=");
+                Serial.print(pkt.packetID);
+                Serial.print(" lat=");
+                Serial.print(pkt.latitude, 6);
+                Serial.print(" lon=");
+                Serial.print(pkt.longitude, 6);
+                Serial.print(" spd=");
+                Serial.print(pkt.speed / 10.0f, 1);
+                Serial.print("km/h turn=");
+                Serial.print(pkt.turnIndicator);
+                Serial.print(" | dist=");
+                Serial.print(dist, 1);
+                Serial.print("m closing=");
+                Serial.print(closingSpeedMs, 2);
+                Serial.print("m/s TTC=");
+                Serial.print(ttc, 1);
+                Serial.println("s");
+
                 // ── Threshold check ──
                 if (dist < ALERT_DISTANCE_M || ttc < ALERT_TTC_S)
                 {
                     fireAlert();
 
-                    Serial.print("[V2V] PROXIMITY ALERT! dist=");
+                    Serial.print("[RISK] *** PROXIMITY ALERT! dist=");
                     Serial.print(dist, 1);
                     Serial.print("m  TTC=");
                     Serial.print(ttc, 1);
@@ -853,6 +1009,7 @@ void taskRiskAssessment(void *pvParameters)
                     // If TTC is critically low, treat as imminent collision
                     if (ttc < 1.5f && dist < 30.0f)
                     {
+                        Serial.println("[RISK] !!! IMMINENT COLLISION — triggering emergency");
                         emergencyCollision = true;
                         logCollisionToSerial(ownLat, ownLon, 1);
                     }
@@ -866,11 +1023,21 @@ void taskRiskAssessment(void *pvParameters)
 
                 // Ignore our own packets
                 if (pkt.vehicleID == myVehicleID)
+                {
+                    dbgRxOwnCount++;
                     continue;
+                }
 
                 // Duplicate suppression — critical for multi-channel rebroadcasts
                 if (isDuplicate(pkt.vehicleID, pkt.packetID))
+                {
+                    dbgRxDupCount++;
+                    Serial.print("[RISK] Duplicate emergency pkt suppressed: vID=");
+                    Serial.print(pkt.vehicleID);
+                    Serial.print(" pktID=");
+                    Serial.println(pkt.packetID);
                     continue;
+                }
 
                 fireAlert();
 
@@ -890,20 +1057,20 @@ void taskRiskAssessment(void *pvParameters)
                     evtName = "UNKNOWN";
                     break;
                 }
-                Serial.print("[V2V] EMERGENCY from vID=");
+                Serial.print("[RISK] *** EMERGENCY from vID=");
                 Serial.print(pkt.vehicleID);
                 Serial.print(" pktID=");
                 Serial.print(pkt.packetID);
                 Serial.print(" Event=");
-                Serial.println(evtName);
-                Serial.print("  Location: ");
+                Serial.print(evtName);
+                Serial.print(" lat=");
                 Serial.print(pkt.latitude, 6);
-                Serial.print(", ");
+                Serial.print(" lon=");
                 Serial.println(pkt.longitude, 6);
 
                 if (pkt.eventCode == 3)
                 {
-                    Serial.println("[V2V] ⚠ Nearby vehicle driver is INCAPACITATED — SOS beacon received!");
+                    Serial.println("[RISK] ⚠ Nearby vehicle driver is INCAPACITATED — SOS beacon!");
                 }
 
                 // Log for emergency responders on the connected laptop
@@ -929,10 +1096,19 @@ void setup()
     {
         ;
     }
-    Serial.println("\n[V2V] ========================================");
-    Serial.println("[V2V]  Vehicle-to-Vehicle Safety System v2.0");
-    Serial.println("[V2V]  No-Cloud | CSMA/CA | Multi-Channel");
-    Serial.println("[V2V] ========================================");
+    Serial.println("\n[SYS] ========================================");
+    Serial.println("[SYS]  Vehicle-to-Vehicle Safety System v2.0");
+    Serial.println("[SYS]  VERBOSE DEBUG MODE — all values printed");
+    Serial.println("[SYS]  No-Cloud | CSMA/CA | Multi-Channel");
+    Serial.println("[SYS] ========================================");
+    Serial.print("[SYS] Free heap: ");
+    Serial.print(ESP.getFreeHeap());
+    Serial.println(" bytes");
+    Serial.print("[SYS] CPU freq: ");
+    Serial.print(ESP.getCpuFreqMHz());
+    Serial.println(" MHz");
+    Serial.print("[SYS] Chip model: ");
+    Serial.println(ESP.getChipModel());
 
     // ── Vehicle ID from ESP32 MAC (unique per chip) ──
     // Use lowest byte of the base MAC — simple and unique enough for local RF
@@ -981,8 +1157,12 @@ void setup()
     radio.openWritingPipe(RF_PIPE_ADDR);
     radio.openReadingPipe(1, RF_PIPE_ADDR);
     radio.startListening();
-    Serial.println("[V2V] NRF24L01 initialised — home channel " + String(RF_CHANNEL));
-    Serial.print("[V2V] Emergency channels: ");
+    Serial.println("[SYS] NRF24L01 initialised OK");
+    Serial.print("[SYS]   Home channel: ");
+    Serial.println(RF_CHANNEL);
+    Serial.print("[SYS]   PA level: MAX | Data rate: 2Mbps | Payload: 32B");
+    Serial.println();
+    Serial.print("[SYS]   Emergency channels: ");
     for (uint8_t i = 0; i < NUM_EMERGENCY_CHANNELS; i++)
     {
         Serial.print(EMERGENCY_CHANNELS[i]);
@@ -990,6 +1170,11 @@ void setup()
             Serial.print(", ");
     }
     Serial.println();
+    Serial.print("[SYS]   NormalPacket size: ");
+    Serial.print(sizeof(NormalPacket));
+    Serial.print("B  EmergencyPacket size: ");
+    Serial.print(sizeof(EmergencyPacket));
+    Serial.println("B");
 
     // ── FreeRTOS Task Creation ──
     // Core 0: GPS + Serial Listener
@@ -1076,16 +1261,20 @@ void setup()
         1 // core 1
     );
 
-    Serial.println("[V2V] All FreeRTOS tasks launched. System active.");
+    Serial.println("[SYS] All FreeRTOS tasks launched. System active.");
+    Serial.println("[SYS] ── Debug tags: [GPS] [TX] [RX] [CSMA] [RISK] [SOS] [DROWSY] [CMD] [SYS] ──");
     digitalWrite(LED_GRN_PIN, LOW); // end self-test blink
 }
 
 // Arduino loop() is essentially idle — all real work is in FreeRTOS tasks.
-// We use it only for a heartbeat LED to confirm the system is alive.
+// We use it for heartbeat LED + periodic debug status dump.
 void loop()
 {
     static uint32_t lastHeartbeat = 0;
+    static uint32_t lastStatusDump = 0;
     uint32_t now = millis();
+
+    // ── Heartbeat blink ──
     if (now - lastHeartbeat >= 2000)
     {
         lastHeartbeat = now;
@@ -1095,5 +1284,57 @@ void loop()
     if (now - lastHeartbeat >= 100 && digitalRead(LED_GRN_PIN))
     {
         digitalWrite(LED_GRN_PIN, LOW);
+    }
+
+    // ── Periodic status dump every 10 s ──
+    if (now - lastStatusDump >= 10000)
+    {
+        lastStatusDump = now;
+        Serial.println("────────────── [SYS] STATUS DUMP ──────────────");
+        Serial.print("  Uptime: ");
+        Serial.print(now / 1000);
+        Serial.println("s");
+        Serial.print("  Free heap: ");
+        Serial.print(ESP.getFreeHeap());
+        Serial.println(" bytes");
+        Serial.print("  GPS: lat=");
+        Serial.print(ownLat, 6);
+        Serial.print(" lon=");
+        Serial.print(ownLon, 6);
+        Serial.print(" speed=");
+        Serial.print(ownSpeed / 10.0f, 1);
+        Serial.print("km/h fixes=");
+        Serial.println(dbgGpsFixCount);
+        Serial.print("  TX: normal=");
+        Serial.print(dbgTxNormalCount);
+        Serial.print(" emergency=");
+        Serial.print(dbgTxEmergencyCount);
+        Serial.print(" nextPktID=");
+        Serial.println(txPacketID);
+        Serial.print("  RX: raw=");
+        Serial.print(dbgRxRawCount);
+        Serial.print(" dup=");
+        Serial.print(dbgRxDupCount);
+        Serial.print(" own=");
+        Serial.print(dbgRxOwnCount);
+        Serial.print(" bufUsed=");
+        Serial.println(rxRingBuffer.count());
+        Serial.print("  CSMA: busyEvents=");
+        Serial.println(dbgCsmaBusyCount);
+        Serial.print("  State: drowsy=");
+        Serial.print(drowsyState);
+        Serial.print(" incapTimer=");
+        Serial.print(incapTimerActive ? "ON" : "OFF");
+        Serial.print(" SOS=");
+        Serial.println(sosActive ? "ON" : "OFF");
+        Serial.print("  GPIO: buzzer=");
+        Serial.print(digitalRead(BUZZER_PIN) ? "ON" : "OFF");
+        Serial.print(" red=");
+        Serial.print(digitalRead(LED_RED_PIN) ? "ON" : "OFF");
+        Serial.print(" grn=");
+        Serial.print(digitalRead(LED_GRN_PIN) ? "ON" : "OFF");
+        Serial.print(" blu=");
+        Serial.println(digitalRead(LED_BLU_PIN) ? "ON" : "OFF");
+        Serial.println("───────────────────────────────────────────────");
     }
 }
