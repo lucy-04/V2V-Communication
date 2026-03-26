@@ -2,9 +2,11 @@
 """
 V2V Drowsiness Detection — Smart Dashcam Simulator
 ====================================================
-Captures webcam frames, detects driver face landmarks via dlib's 68-point
-predictor, computes Eye Aspect Ratio (EAR), and sends ``DROWSY_ALERT`` over
-serial to the ESP32 when the driver's eyes are closed for too long.
+Captures webcam frames, detects the DRIVER's face (rightmost-closest person)
+via dlib's 68-point predictor, computes Eye Aspect Ratio (EAR), and sends
+``DROWSY_ALERT`` over serial to the ESP32 when:
+  1. The driver's eyes are closed for too many consecutive frames, OR
+  2. The driver's head drops out of frame for > 4 seconds (face lost).
 
 Usage:
     # With serial output to ESP32
@@ -29,14 +31,18 @@ import imutils
 from imutils import face_utils
 
 # ─────────────────────── Constants ────────────────────────────────────────────
-# dlib 68-point landmark indices for left and right eyes
+# dlib 68-point landmark indices
 LEFT_EYE_IDX  = face_utils.FACIAL_LANDMARKS_68_IDXS["left_eye"]
 RIGHT_EYE_IDX = face_utils.FACIAL_LANDMARKS_68_IDXS["right_eye"]
+NOSE_IDX      = face_utils.FACIAL_LANDMARKS_68_IDXS["nose"]
+JAW_IDX       = face_utils.FACIAL_LANDMARKS_68_IDXS["jaw"]
 
 # Colours for overlay (BGR)
 GREEN  = (0, 255, 0)
 RED    = (0, 0, 255)
 YELLOW = (0, 255, 255)
+CYAN   = (255, 255, 0)
+ORANGE = (0, 165, 255)
 
 
 # ─────────────────────── EAR Calculation ──────────────────────────────────────
@@ -46,24 +52,60 @@ def eye_aspect_ratio(eye: np.ndarray) -> float:
 
     EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)
 
-    Where p1..p6 are the 6 landmark points of the eye in order.
     A value near 0.3 means open; near 0.15 means closed.
-
-    Args:
-        eye: numpy array of shape (6, 2) containing the (x, y) coordinates
-             of the 6 eye landmarks.
-
-    Returns:
-        The EAR as a float.
     """
-    # Vertical distances
     A = dist.euclidean(eye[1], eye[5])
     B = dist.euclidean(eye[2], eye[4])
-    # Horizontal distance
     C = dist.euclidean(eye[0], eye[3])
+    return (A + B) / (2.0 * C)
 
-    ear = (A + B) / (2.0 * C)
-    return ear
+
+# ─────────────────────── Driver Selection ─────────────────────────────────────
+def select_driver_face(faces, frame_width):
+    """
+    From a list of detected faces, select the DRIVER — defined as the
+    rightmost AND closest (largest bounding-box area) face.
+
+    Strategy:
+      1. Score each face: score = (face_right_x / frame_width) * 0.6
+                                + (face_area / max_area)       * 0.4
+         Right-side bias (60%) + size/closeness bias (40%).
+      2. Return the face with the highest score.
+
+    This handles the dashcam being in the centre of the car: the driver is
+    to the right of the camera and is the closest person to it.
+
+    Args:
+        faces: list of dlib rectangles from the face detector.
+        frame_width: width of the frame in pixels.
+
+    Returns:
+        The single dlib rectangle for the driver, or None if no faces.
+    """
+    if len(faces) == 0:
+        return None
+    if len(faces) == 1:
+        return faces[0]
+
+    # Compute areas
+    areas = []
+    for f in faces:
+        areas.append((f.right() - f.left()) * (f.bottom() - f.top()))
+    max_area = max(areas) if max(areas) > 0 else 1
+
+    best_score = -1.0
+    best_face = None
+    for f, area in zip(faces, areas):
+        # Normalised right-edge position (0 = left edge, 1 = right edge)
+        right_norm = f.right() / frame_width
+        # Normalised area (larger = closer to camera)
+        area_norm = area / max_area
+        # Weighted score — favour right side + closeness
+        score = right_norm * 0.6 + area_norm * 0.4
+        if score > best_score:
+            best_score = score
+            best_face = f
+    return best_face
 
 
 # ─────────────────────── Serial Wrapper ───────────────────────────────────────
@@ -138,6 +180,11 @@ def main():
         help="Seconds to wait before re-triggering alert (default: 5.0)"
     )
     parser.add_argument(
+        "--head-down-timeout", type=float, default=4.0,
+        help="Seconds the driver's face can be missing before triggering alert "
+             "(default: 4.0)"
+    )
+    parser.add_argument(
         "--shape-predictor", type=str,
         default="shape_predictor_68_face_landmarks.dat",
         help="Path to dlib shape predictor model file"
@@ -175,11 +222,17 @@ def main():
     )
 
     # ── State ──
-    consec_counter = 0        # frames with EAR below threshold
-    last_alert_time = 0.0     # timestamp of last DROWSY_ALERT sent
+    consec_counter = 0              # consecutive frames with EAR below threshold
+    last_alert_time = 0.0           # timestamp of last DROWSY_ALERT sent
     alert_active = False
+    alert_reason = ""
 
-    print("[INIT] Drowsiness detector running. Press 'q' to quit.\n")
+    # Head-down / face-lost tracking
+    driver_last_seen_time = time.time()   # last time we detected the driver's face
+    head_down_alert_sent = False          # avoid repeating while head is still down
+
+    print("[INIT] Drowsiness detector running. Press 'q' to quit.")
+    print("[INIT] Driver = rightmost-closest face to the dashcam.\n")
 
     try:
         while True:
@@ -190,13 +243,51 @@ def main():
 
             frame = imutils.resize(frame, width=640)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame_h, frame_w = frame.shape[:2]
+            now = time.time()
 
-            # Detect faces
+            # Detect all faces
             faces = detector(gray, 0)
 
+            # ── Select only the DRIVER (rightmost + closest) ──
+            driver_face = select_driver_face(faces, frame_w)
+
+            # Draw faded boxes around non-driver faces (so user sees them ignored)
             for face in faces:
-                # Get 68 facial landmarks
-                shape = predictor(gray, face)
+                if driver_face is not None and face == driver_face:
+                    continue  # skip driver — drawn separately below
+                cv2.rectangle(
+                    frame,
+                    (face.left(), face.top()),
+                    (face.right(), face.bottom()),
+                    (128, 128, 128), 1
+                )
+                cv2.putText(
+                    frame, "passenger",
+                    (face.left(), face.top() - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1
+                )
+
+            if driver_face is not None:
+                # ── Driver detected — reset head-down timer ──
+                driver_last_seen_time = now
+                head_down_alert_sent = False
+
+                # Draw driver bounding box
+                cv2.rectangle(
+                    frame,
+                    (driver_face.left(), driver_face.top()),
+                    (driver_face.right(), driver_face.bottom()),
+                    CYAN, 2
+                )
+                cv2.putText(
+                    frame, "DRIVER",
+                    (driver_face.left(), driver_face.top() - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, CYAN, 2
+                )
+
+                # Get 68 facial landmarks for the driver only
+                shape = predictor(gray, driver_face)
                 shape = face_utils.shape_to_np(shape)
 
                 # Extract eye regions
@@ -214,27 +305,27 @@ def main():
                 cv2.drawContours(frame, [left_hull],  -1, GREEN, 1)
                 cv2.drawContours(frame, [right_hull], -1, GREEN, 1)
 
-                # ── Drowsiness logic ──
+                # ── Drowsiness logic (eyes closed) ──
                 if avg_ear < args.ear_threshold:
                     consec_counter += 1
 
                     if consec_counter >= args.consec_frames:
-                        now = time.time()
                         if now - last_alert_time > args.cooldown:
-                            # ── TRIGGER ALERT ──
                             bridge.send_alert()
                             last_alert_time = now
                             alert_active = True
-                        
-                        # Visual warning on frame
+                            alert_reason = "EYES CLOSED"
+
                         cv2.putText(
-                            frame, "*** DROWSINESS DETECTED ***",
+                            frame, "*** DROWSINESS: EYES CLOSED ***",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                             0.7, RED, 2
                         )
                 else:
                     consec_counter = 0
-                    alert_active = False
+                    if alert_reason == "EYES CLOSED":
+                        alert_active = False
+                        alert_reason = ""
 
                 # ── EAR overlay ──
                 colour = RED if avg_ear < args.ear_threshold else GREEN
@@ -244,12 +335,51 @@ def main():
                     0.6, colour, 2
                 )
 
-            # Status bar
-            status_colour = RED if alert_active else GREEN
-            status_text = "ALERT!" if alert_active else "Monitoring"
+            else:
+                # ── No driver face detected — possible head-down ──
+                consec_counter = 0   # reset EAR counter since we can't see eyes
+                elapsed_missing = now - driver_last_seen_time
+
+                if elapsed_missing >= args.head_down_timeout:
+                    # Driver's face has been missing for too long → head-down alert
+                    if not head_down_alert_sent:
+                        if now - last_alert_time > args.cooldown:
+                            bridge.send_alert()
+                            last_alert_time = now
+                            head_down_alert_sent = True
+                            alert_active = True
+                            alert_reason = "HEAD DOWN"
+                            print(f"[ALERT] Driver face lost for "
+                                  f"{elapsed_missing:.1f}s — HEAD DOWN detected!")
+
+                    cv2.putText(
+                        frame, "*** DROWSINESS: HEAD DOWN ***",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, RED, 2
+                    )
+
+                elif elapsed_missing > 1.0:
+                    # Warning: face missing but not yet at threshold
+                    remaining = args.head_down_timeout - elapsed_missing
+                    cv2.putText(
+                        frame, f"Driver face lost ({remaining:.1f}s to alert)",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, ORANGE, 2
+                    )
+
+            # ── Status bar ──
+            if alert_active:
+                status_text = f"ALERT: {alert_reason}"
+                status_colour = RED
+            else:
+                num_faces = len(faces)
+                driver_str = "driver locked" if driver_face else "no driver"
+                status_text = f"Monitoring — {num_faces} face(s), {driver_str}"
+                status_colour = GREEN
+
             cv2.putText(
                 frame, f"Status: {status_text}",
-                (10, frame.shape[0] - 10),
+                (10, frame_h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_colour, 1
             )
 

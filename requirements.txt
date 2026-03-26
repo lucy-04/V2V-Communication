@@ -1,5 +1,5 @@
 opencv-python>=4.8.0
-dlib>=19.24.0
+dlib-bin
 numpy>=1.24.0
 scipy>=1.10.0
 pyserial>=3.5
