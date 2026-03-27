@@ -4,25 +4,33 @@ V2V Drowsiness Detection — Smart Dashcam Simulator
 ====================================================
 Captures webcam frames, detects the DRIVER's face (rightmost-closest person)
 via dlib's 68-point predictor, computes Eye Aspect Ratio (EAR), and sends
-``DROWSY_ALERT`` over serial to the ESP32 when:
-  1. The driver's eyes are closed for more than 3 seconds (time-based), OR
-  2. The driver's head drops out of frame for > 4 seconds (face lost).
+alerts over serial to the ESP32:
+
+  1. Eyes closed for 3 seconds  → DROWSY_ALERT  (buzzer wake-up attempt)
+  2. Head out of frame for 4 s  → DROWSY_ALERT  (head-down detection)
+  3. Continuous sleep for 10 s  → SOS_TRIGGER   (emergency beacon + WhatsApp)
+
+WhatsApp alert uses the free CallMeBot API.  To enable it:
+  1. Save +34 644 52 74 88 in your contacts as "CallMeBot"
+  2. Send "I allow callmebot to send me messages" to that number on WhatsApp
+  3. You'll receive an API key — pass it with --whatsapp-apikey
 
 Usage:
-    # With serial output to ESP32
-    python drowsiness_detector.py --port /dev/tty.usbserial-0001 --baud 115200
+    python drowsiness_detector.py --port COM4 --baud 115200 --whatsapp-apikey 123456
 
-    # Dry-run (no serial, console only)
+    # Dry-run (no serial, no WhatsApp)
     python drowsiness_detector.py --no-serial
 
     # Custom thresholds
-    python drowsiness_detector.py --ear-threshold 0.22 --closed-seconds 3.0
+    python drowsiness_detector.py --ear-threshold 0.22 --closed-seconds 3.0 --sos-seconds 10.0
 """
 
 import argparse
 import time
 import sys
 import threading
+import urllib.request
+import urllib.parse
 
 import cv2
 import dlib
@@ -32,29 +40,22 @@ import imutils
 from imutils import face_utils
 
 # ─────────────────────── Constants ────────────────────────────────────────────
-# dlib 68-point landmark indices
 LEFT_EYE_IDX  = face_utils.FACIAL_LANDMARKS_68_IDXS["left_eye"]
 RIGHT_EYE_IDX = face_utils.FACIAL_LANDMARKS_68_IDXS["right_eye"]
 NOSE_IDX      = face_utils.FACIAL_LANDMARKS_68_IDXS["nose"]
 JAW_IDX       = face_utils.FACIAL_LANDMARKS_68_IDXS["jaw"]
 
-# Colours for overlay (BGR)
 GREEN  = (0, 255, 0)
 RED    = (0, 0, 255)
 YELLOW = (0, 255, 255)
 CYAN   = (255, 255, 0)
 ORANGE = (0, 165, 255)
 
+EMERGENCY_PHONE = "+918800830233"
+
 
 # ─────────────────────── EAR Calculation ──────────────────────────────────────
 def eye_aspect_ratio(eye: np.ndarray) -> float:
-    """
-    Compute the Eye Aspect Ratio (EAR) for a single eye.
-
-    EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)
-
-    A value near 0.3 means open; near 0.15 means closed.
-    """
     A = dist.euclidean(eye[1], eye[5])
     B = dist.euclidean(eye[2], eye[4])
     C = dist.euclidean(eye[0], eye[3])
@@ -63,32 +64,11 @@ def eye_aspect_ratio(eye: np.ndarray) -> float:
 
 # ─────────────────────── Driver Selection ─────────────────────────────────────
 def select_driver_face(faces, frame_width):
-    """
-    From a list of detected faces, select the DRIVER — defined as the
-    rightmost AND closest (largest bounding-box area) face.
-
-    Strategy:
-      1. Score each face: score = (face_right_x / frame_width) * 0.6
-                                + (face_area / max_area)       * 0.4
-         Right-side bias (60%) + size/closeness bias (40%).
-      2. Return the face with the highest score.
-
-    This handles the dashcam being in the centre of the car: the driver is
-    to the right of the camera and is the closest person to it.
-
-    Args:
-        faces: list of dlib rectangles from the face detector.
-        frame_width: width of the frame in pixels.
-
-    Returns:
-        The single dlib rectangle for the driver, or None if no faces.
-    """
     if len(faces) == 0:
         return None
     if len(faces) == 1:
         return faces[0]
 
-    # Compute areas
     areas = []
     for f in faces:
         areas.append((f.right() - f.left()) * (f.bottom() - f.top()))
@@ -97,11 +77,8 @@ def select_driver_face(faces, frame_width):
     best_score = -1.0
     best_face = None
     for f, area in zip(faces, areas):
-        # Normalised right-edge position (0 = left edge, 1 = right edge)
         right_norm = f.right() / frame_width
-        # Normalised area (larger = closer to camera)
         area_norm = area / max_area
-        # Weighted score — favour right side + closeness
         score = right_norm * 0.6 + area_norm * 0.4
         if score > best_score:
             best_score = score
@@ -109,13 +86,44 @@ def select_driver_face(faces, frame_width):
     return best_face
 
 
+# ─────────────────────── WhatsApp SOS via CallMeBot ───────────────────────────
+def send_whatsapp_sos(phone: str, apikey: str, lat: float = 0.0, lon: float = 0.0):
+    """Send an emergency WhatsApp message via the free CallMeBot API."""
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    message = (
+        "🚨 V2V EMERGENCY SOS 🚨\n"
+        "Driver is INCAPACITATED!\n"
+        f"Time: {timestamp}\n"
+    )
+    if lat != 0.0 or lon != 0.0:
+        message += f"Location: {lat:.6f}, {lon:.6f}\n"
+        message += f"Maps: https://maps.google.com/?q={lat},{lon}"
+    else:
+        message += "Location: GPS not available"
+
+    encoded_msg = urllib.parse.quote(message)
+    url = (
+        f"https://api.callmebot.com/whatsapp.php"
+        f"?phone={phone}&text={encoded_msg}&apikey={apikey}"
+    )
+
+    try:
+        req = urllib.request.Request(url)
+        response = urllib.request.urlopen(req, timeout=10)
+        status = response.getcode()
+        print(f"[WHATSAPP] SOS sent to {phone} (HTTP {status})")
+        return True
+    except Exception as e:
+        print(f"[WHATSAPP] ERROR sending to {phone}: {e}")
+        return False
+
+
 # ─────────────────────── Serial Wrapper ───────────────────────────────────────
 class SerialBridge:
     """
-    Wraps pyserial to send commands to ESP32 and read back all debug output.
-    A background thread continuously reads ESP32 serial output and prints it
-    so you can see every value (GPS, TX, RX, CSMA, RISK, etc.) in one terminal.
-    If ``--no-serial`` is passed, operates in dry-run mode (console only).
+    Wraps pyserial to send commands to ESP32 and read back all output.
+    Background thread reads ESP32 serial and extracts GPS coordinates.
     """
 
     def __init__(self, port: str | None, baud: int, dry_run: bool = False):
@@ -124,13 +132,16 @@ class SerialBridge:
         self._reader_thread = None
         self._running = False
 
+        # Track latest GPS coordinates from ESP32 output
+        self.last_lat = 0.0
+        self.last_lon = 0.0
+
         if not dry_run and port:
             try:
                 import serial
                 self.ser = serial.Serial(port, baud, timeout=0.1)
-                time.sleep(2)  # wait for ESP32 to reboot on serial connect
+                time.sleep(2)
                 print(f"[SERIAL] Connected to {port} @ {baud} baud")
-                # Start background reader thread
                 self._running = True
                 self._reader_thread = threading.Thread(
                     target=self._read_loop, daemon=True
@@ -142,18 +153,28 @@ class SerialBridge:
                 self.dry_run = True
 
     def _read_loop(self):
-        """Background thread: continuously reads and prints ESP32 serial output."""
+        """Background thread: reads ESP32 output and extracts GPS coordinates."""
         while self._running and self.ser and self.ser.is_open:
             try:
                 if self.ser.in_waiting > 0:
                     line = self.ser.readline().decode("utf-8", errors="replace").rstrip()
                     if line:
                         print(f"[ESP32] {line}")
+                        # Extract GPS coordinates from ESP32 output
+                        if "LAT:" in line:
+                            try:
+                                self.last_lat = float(line.split("LAT:")[1].strip())
+                            except (ValueError, IndexError):
+                                pass
+                        if "LON:" in line:
+                            try:
+                                self.last_lon = float(line.split("LON:")[1].strip())
+                            except (ValueError, IndexError):
+                                pass
             except Exception:
-                pass  # port closed or read error — silently continue
+                pass
 
     def send(self, message: str):
-        """Send a raw string to the ESP32 (with newline appended)."""
         msg = message + "\n"
         if self.dry_run or self.ser is None:
             print(f"[DRY-RUN] Would send: {message}")
@@ -163,16 +184,17 @@ class SerialBridge:
             print(f"[SERIAL] Sent: {message}")
 
     def send_alert(self):
-        """Send DROWSY_ALERT to the ESP32."""
         self.send("DROWSY_ALERT")
 
     def send_cancel(self):
-        """Send CANCEL_DROWSY to the ESP32."""
         self.send("CANCEL_DROWSY")
 
     def send_driver_ok(self):
-        """Send DRIVER_OK to the ESP32 (cancels incap timer / SOS)."""
         self.send("DRIVER_OK")
+
+    def send_sos_trigger(self):
+        """Directly trigger SOS mode on ESP32 — bypasses incap timer."""
+        self.send("SOS_TRIGGER")
 
     def close(self):
         self._running = False
@@ -189,7 +211,7 @@ def main():
     )
     parser.add_argument(
         "--port", type=str, default=None,
-        help="Serial port for ESP32 (e.g., /dev/tty.usbserial-0001 or COM3)"
+        help="Serial port for ESP32 (e.g., COM4 or /dev/ttyUSB0)"
     )
     parser.add_argument(
         "--baud", type=int, default=115200,
@@ -205,21 +227,27 @@ def main():
     )
     parser.add_argument(
         "--ear-threshold", type=float, default=0.25,
-        help="EAR threshold below which eyes are considered closed (default: 0.25)"
+        help="EAR below which eyes are considered closed (default: 0.25)"
     )
     parser.add_argument(
         "--closed-seconds", type=float, default=3.0,
-        help="Seconds eyes must be continuously closed to trigger alert "
-             "(default: 3.0)"
+        help="Seconds eyes must be closed to trigger DROWSY_ALERT (default: 3.0)"
+    )
+    parser.add_argument(
+        "--sos-seconds", type=float, default=10.0,
+        help="Seconds of continuous sleep to trigger SOS emergency (default: 10.0)"
     )
     parser.add_argument(
         "--cooldown", type=float, default=5.0,
-        help="Seconds to wait before re-triggering alert (default: 5.0)"
+        help="Cooldown between DROWSY_ALERTs (default: 5.0)"
     )
     parser.add_argument(
         "--head-down-timeout", type=float, default=4.0,
-        help="Seconds the driver's face can be missing before triggering alert "
-             "(default: 4.0)"
+        help="Seconds without driver face before alert (default: 4.0)"
+    )
+    parser.add_argument(
+        "--whatsapp-apikey", type=str, default=None,
+        help="CallMeBot API key for WhatsApp SOS messages"
     )
     parser.add_argument(
         "--shape-predictor", type=str,
@@ -259,17 +287,25 @@ def main():
     )
 
     # ── State ──
-    eyes_closed_since = None        # timestamp when eyes first closed (None = open)
-    last_alert_time = 0.0           # timestamp of last DROWSY_ALERT sent
+    eyes_closed_since = None        # timestamp when eyes first closed
+    sleep_start_time = None         # tracks CONTINUOUS sleep (eyes or head-down)
+    last_alert_time = 0.0           # timestamp of last DROWSY_ALERT
     alert_active = False
     alert_reason = ""
+    sos_triggered = False           # True once SOS has been sent for this sleep episode
 
     # Head-down / face-lost tracking
-    driver_last_seen_time = time.time()   # last time we detected the driver's face
-    head_down_alert_sent = False          # avoid repeating while head is still down
+    driver_last_seen_time = time.time()
+    head_down_alert_sent = False
 
+    # WhatsApp status
+    if args.whatsapp_apikey:
+        print(f"[INIT] WhatsApp SOS enabled → {EMERGENCY_PHONE}")
+    else:
+        print("[INIT] WhatsApp SOS disabled (no --whatsapp-apikey provided)")
+
+    print(f"[INIT] Thresholds: DROWSY={args.closed_seconds}s  SOS={args.sos_seconds}s")
     print("[INIT] Drowsiness detector running. Press 'q' to quit.")
-    print("[INIT] Driver = rightmost-closest face to the dashcam.")
     print("[INIT] Keyboard: 'q'=quit  'o'=DRIVER_OK  'c'=CANCEL_DROWSY")
     if not bridge.dry_run:
         print("[INIT] ESP32 output will appear with [ESP32] prefix.\n")
@@ -288,16 +324,13 @@ def main():
             frame_h, frame_w = frame.shape[:2]
             now = time.time()
 
-            # Detect all faces
             faces = detector(gray, 0)
-
-            # ── Select only the DRIVER (rightmost + closest) ──
             driver_face = select_driver_face(faces, frame_w)
 
-            # Draw faded boxes around non-driver faces (so user sees them ignored)
+            # Draw faded boxes around non-driver faces
             for face in faces:
                 if driver_face is not None and face == driver_face:
-                    continue  # skip driver — drawn separately below
+                    continue
                 cv2.rectangle(
                     frame,
                     (face.left(), face.top()),
@@ -310,8 +343,13 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1
                 )
 
+            # ══════════════════════════════════════════════════════════════
+            # Determine if driver is "asleep" this frame
+            # (for the continuous 10s SOS tracker)
+            # ══════════════════════════════════════════════════════════════
+            driver_is_asleep = False
+
             if driver_face is not None:
-                # ── Driver detected — reset head-down timer ──
                 driver_last_seen_time = now
                 head_down_alert_sent = False
 
@@ -328,32 +366,32 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, CYAN, 2
                 )
 
-                # Get 68 facial landmarks for the driver only
+                # Get 68 facial landmarks
                 shape = predictor(gray, driver_face)
                 shape = face_utils.shape_to_np(shape)
 
-                # Extract eye regions
                 left_eye  = shape[LEFT_EYE_IDX[0]:LEFT_EYE_IDX[1]]
                 right_eye = shape[RIGHT_EYE_IDX[0]:RIGHT_EYE_IDX[1]]
 
-                # Compute EAR for both eyes and average
                 left_ear  = eye_aspect_ratio(left_eye)
                 right_ear = eye_aspect_ratio(right_eye)
                 avg_ear   = (left_ear + right_ear) / 2.0
 
-                # ── Draw eye contours ──
+                # Draw eye contours
                 left_hull  = cv2.convexHull(left_eye)
                 right_hull = cv2.convexHull(right_eye)
                 cv2.drawContours(frame, [left_hull],  -1, GREEN, 1)
                 cv2.drawContours(frame, [right_hull], -1, GREEN, 1)
 
-                # ── Drowsiness logic (time-based: eyes closed for N seconds) ──
+                # ── Eyes closed detection (time-based) ──
                 if avg_ear < args.ear_threshold:
                     if eyes_closed_since is None:
-                        eyes_closed_since = now  # mark when eyes first closed
+                        eyes_closed_since = now
 
                     closed_duration = now - eyes_closed_since
+                    driver_is_asleep = True  # eyes are closed → asleep
 
+                    # 3s threshold → DROWSY_ALERT (wake-up attempt)
                     if closed_duration >= args.closed_seconds:
                         if now - last_alert_time > args.cooldown:
                             bridge.send_alert()
@@ -362,12 +400,11 @@ def main():
                             alert_reason = "EYES CLOSED"
 
                         cv2.putText(
-                            frame, "*** DROWSINESS: EYES CLOSED ***",
+                            frame, f"*** DROWSY: EYES CLOSED ({closed_duration:.1f}s) ***",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                             0.7, RED, 2
                         )
                     elif closed_duration > 1.0:
-                        # Warning: eyes closing but not yet at threshold
                         remaining = args.closed_seconds - closed_duration
                         cv2.putText(
                             frame, f"Eyes closing... ({remaining:.1f}s to alert)",
@@ -375,12 +412,12 @@ def main():
                             0.6, ORANGE, 2
                         )
                 else:
-                    eyes_closed_since = None  # eyes opened — reset timer
+                    eyes_closed_since = None
                     if alert_reason == "EYES CLOSED":
                         alert_active = False
                         alert_reason = ""
 
-                # ── EAR overlay ──
+                # EAR overlay
                 colour = RED if avg_ear < args.ear_threshold else GREEN
                 cv2.putText(
                     frame, f"EAR: {avg_ear:.3f}",
@@ -389,12 +426,13 @@ def main():
                 )
 
             else:
-                # ── No driver face detected — possible head-down ──
-                eyes_closed_since = None  # reset timer since we can't see eyes
+                # ── No driver face → possible head-down ──
+                eyes_closed_since = None
                 elapsed_missing = now - driver_last_seen_time
 
                 if elapsed_missing >= args.head_down_timeout:
-                    # Driver's face has been missing for too long → head-down alert
+                    driver_is_asleep = True  # head is down → asleep
+
                     if not head_down_alert_sent:
                         if now - last_alert_time > args.cooldown:
                             bridge.send_alert()
@@ -406,13 +444,12 @@ def main():
                                   f"{elapsed_missing:.1f}s — HEAD DOWN detected!")
 
                     cv2.putText(
-                        frame, "*** DROWSINESS: HEAD DOWN ***",
+                        frame, f"*** DROWSY: HEAD DOWN ({elapsed_missing:.1f}s) ***",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                         0.7, RED, 2
                     )
 
                 elif elapsed_missing > 1.0:
-                    # Warning: face missing but not yet at threshold
                     remaining = args.head_down_timeout - elapsed_missing
                     cv2.putText(
                         frame, f"Driver face lost ({remaining:.1f}s to alert)",
@@ -420,8 +457,66 @@ def main():
                         0.6, ORANGE, 2
                     )
 
+            # ══════════════════════════════════════════════════════════════
+            # CONTINUOUS SLEEP TRACKER → SOS after 10 seconds
+            # ══════════════════════════════════════════════════════════════
+            if driver_is_asleep:
+                if sleep_start_time is None:
+                    sleep_start_time = now
+
+                total_sleep = now - sleep_start_time
+
+                # 10s continuous sleep → SOS EMERGENCY
+                if total_sleep >= args.sos_seconds and not sos_triggered:
+                    sos_triggered = True
+
+                    print("=" * 50)
+                    print("[SOS] DRIVER INCAPACITATED — 10s continuous sleep!")
+                    print("[SOS] Triggering emergency beacon on ESP32...")
+                    print("=" * 50)
+
+                    # Tell ESP32 to go directly into SOS mode
+                    bridge.send_sos_trigger()
+
+                    # Send WhatsApp message
+                    if args.whatsapp_apikey:
+                        print("[SOS] Sending WhatsApp SOS message...")
+                        send_whatsapp_sos(
+                            phone=EMERGENCY_PHONE,
+                            apikey=args.whatsapp_apikey,
+                            lat=bridge.last_lat,
+                            lon=bridge.last_lon,
+                        )
+                    else:
+                        print("[SOS] WhatsApp not configured (--whatsapp-apikey not set)")
+
+                # Show SOS countdown on screen
+                if total_sleep > args.closed_seconds and not sos_triggered:
+                    remaining_sos = args.sos_seconds - total_sleep
+                    cv2.putText(
+                        frame, f"SOS in {remaining_sos:.1f}s",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, ORANGE, 2
+                    )
+                elif sos_triggered:
+                    cv2.putText(
+                        frame, "!!! SOS BEACON ACTIVE !!!",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, RED, 2
+                    )
+            else:
+                # Driver is awake — reset everything
+                if sleep_start_time is not None:
+                    sleep_start_time = None
+                if sos_triggered:
+                    sos_triggered = False
+                    print("[SOS] Driver woke up — SOS state cleared on Python side.")
+
             # ── Status bar ──
-            if alert_active:
+            if sos_triggered:
+                status_text = "!!! SOS ACTIVE !!!"
+                status_colour = RED
+            elif alert_active:
                 status_text = f"ALERT: {alert_reason}"
                 status_colour = RED
             else:
@@ -438,12 +533,14 @@ def main():
 
             cv2.imshow("V2V Drowsiness Detector", frame)
 
-            # Quit on 'q', send DRIVER_OK on 'o', CANCEL_DROWSY on 'c'
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             elif key == ord("o"):
                 bridge.send_driver_ok()
+                # Also reset SOS state locally
+                sos_triggered = False
+                sleep_start_time = None
             elif key == ord("c"):
                 bridge.send_cancel()
 

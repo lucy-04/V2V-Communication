@@ -563,6 +563,16 @@ void taskSerialListener(void *pvParameters)
                         setOledAlert("!! DROWSY !!");
                     }
                 }
+                // ── SOS_TRIGGER — Python detected 10s continuous sleep ──
+                else if (lineIdx > 0 && strstr(lineBuf, "SOS_TRIGGER") != nullptr)
+                {
+                    // Go directly into SOS mode — bypass incap timer
+                    incapTimerActive = false;
+                    sosActive = true;
+                    lastSosBeacon = 0; // force immediate beacon
+                    drowsyState = 0;   // stop any wake-up sequence
+                    setOledAlert("!! SOS MODE ON !!");
+                }
                 lineIdx = 0;
             }
             else if (lineIdx < sizeof(lineBuf) - 1)
@@ -603,7 +613,7 @@ void taskRFTransmit(void *pvParameters)
             logCollisionToSerial(pkt.latitude, pkt.longitude, pkt.eventCode);
             fireAlert();
             setOledAlert("TX DROWSY EMERG");
-            startIncapTimer();
+            // NOTE: No startIncapTimer() here — Python handles the 10s SOS logic
         }
 
         if (emergencyCollision)
