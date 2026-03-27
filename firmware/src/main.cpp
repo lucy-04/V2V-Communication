@@ -550,6 +550,8 @@ void taskSerialListener(void *pvParameters)
                 else if (lineIdx > 0 && strstr(lineBuf, "CANCEL_DROWSY") != nullptr)
                 {
                     drowsyCancelFlag = true;
+                    incapTimerActive = false; // Add this!
+                    sosActive = false;        // Add this!
                 }
                 else if (lineIdx > 0 && strstr(lineBuf, "DROWSY_ALERT") != nullptr)
                 {

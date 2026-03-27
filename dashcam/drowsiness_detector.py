@@ -351,7 +351,12 @@ def main():
 
             if driver_face is not None:
                 driver_last_seen_time = now
-                head_down_alert_sent = False
+                if head_down_alert_sent:
+                    head_down_alert_sent = False
+                    if alert_reason == "HEAD DOWN":
+                        alert_active = False
+                        alert_reason = ""
+                        bridge.send_driver_ok()  # Driver face regained, clear alert
 
                 # Draw driver bounding box
                 cv2.rectangle(
@@ -416,6 +421,7 @@ def main():
                     if alert_reason == "EYES CLOSED":
                         alert_active = False
                         alert_reason = ""
+                        bridge.send_driver_ok()  # Driver opened eyes, clear alert
 
                 # EAR overlay
                 colour = RED if avg_ear < args.ear_threshold else GREEN
@@ -511,6 +517,7 @@ def main():
                 if sos_triggered:
                     sos_triggered = False
                     print("[SOS] Driver woke up — SOS state cleared on Python side.")
+                    bridge.send_driver_ok()  # Clear SOS on ESP32
 
             # ── Status bar ──
             if sos_triggered:
@@ -557,41 +564,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-"""
-### User Input
-
-it is still causing an issue the i want to send a sos beacon only if the driver is asleep for straight 10 seconds if he wakes up in between then that 10 seconds reset right now i don't know what is happeneing but sos beacon is triggering even if i am not asleep for continuous 10 seconds
-
-*Edited relevant file*
-
-### Planner Response
-
-I see the problem. There are **two independent SOS paths** and they're fighting:
-
-1. **Python's 10s tracker** (the new one) — this is what you want
-2. **ESP32's own 30s incap timer** — this auto-starts when the drowsy wake-up fails (~4.5s after DROWSY_ALERT), and runs independently even if you wake up
-
-So the SOS fires because: you close eyes for 3s → DROWSY_ALERT → ESP32 wake-up runs → wake-up fails → ESP32 starts its own 30s incap timer → SOS fires even though you opened your eyes.
-
-**Fix**: Remove ESP32's auto-incap-timer from the drowsy path (Python handles this now), and make Python send `DRIVER_OK` when you wake up to cancel anything running on ESP32.
-
-*Viewed [main.cpp](file:///c:/Users/yuval/OneDrive/Desktop/V2V/V2V-Communication/firmware/src/main.cpp) *
-
-### User Input
-
-Continue
-
-*Viewed [main.cpp](file:///c:/Users/yuval/OneDrive/Desktop/V2V/V2V-Communication/firmware/src/main.cpp) *
-
-### Planner Response
-
-Good. Now I'll make both fixes:
-
-**ESP32**: Remove `startIncapTimer()` from the drowsy emergency path (Python's 10s tracker handles SOS now), and make `CANCEL_DROWSY` also cancel the incap timer.
-
-**Python**: When driver wakes up, automatically send `DRIVER_OK` to ESP32 to kill any running timers.
-
-*Edited relevant file*
-
-this is what has happened till now can you continue and fix it 
-"""
