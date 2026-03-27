@@ -8,17 +8,16 @@ alerts over serial to the ESP32:
 
   1. Eyes closed for 3 seconds  → DROWSY_ALERT  (buzzer wake-up attempt)
   2. Head out of frame for 4 s  → DROWSY_ALERT  (head-down detection)
-  3. Continuous sleep for 10 s  → SOS_TRIGGER   (emergency beacon + WhatsApp)
+  3. Continuous sleep for 10 s  → SOS_TRIGGER   (emergency beacon + Telegram)
 
-WhatsApp alert uses the free CallMeBot API.  To enable it:
-  1. Save +34 644 52 74 88 in your contacts as "CallMeBot"
-  2. Send "I allow callmebot to send me messages" to that number on WhatsApp
-  3. You'll receive an API key — pass it with --whatsapp-apikey
+Telegram alert uses the free CallMeBot API.  To enable it:
+  1. Send /start to @CallMeBot_txtbot on Telegram
+  2. Pass your Telegram username with --telegram-user @yourusername
 
 Usage:
-    python drowsiness_detector.py --port COM4 --baud 115200 --whatsapp-apikey 123456
+    python drowsiness_detector.py --port COM4 --baud 115200 --telegram-user @yourusername
 
-    # Dry-run (no serial, no WhatsApp)
+    # Dry-run (no serial, no Telegram)
     python drowsiness_detector.py --no-serial
 
     # Custom thresholds
@@ -26,11 +25,14 @@ Usage:
 """
 
 import argparse
+import subprocess
 import time
 import sys
 import threading
 import urllib.request
 import urllib.parse
+import ssl
+import certifi
 
 import cv2
 import dlib
@@ -38,6 +40,9 @@ import numpy as np
 from scipy.spatial import distance as dist
 import imutils
 from imutils import face_utils
+
+# SSL context using certifi certs (fixes macOS SSL errors)
+SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
 # ─────────────────────── Constants ────────────────────────────────────────────
 LEFT_EYE_IDX  = face_utils.FACIAL_LANDMARKS_68_IDXS["left_eye"]
@@ -51,7 +56,7 @@ YELLOW = (0, 255, 255)
 CYAN   = (255, 255, 0)
 ORANGE = (0, 165, 255)
 
-EMERGENCY_PHONE = "+918800830233"
+EMERGENCY_PHONE = "+918800830233"  # kept for reference / future use
 
 
 # ─────────────────────── EAR Calculation ──────────────────────────────────────
@@ -86,36 +91,46 @@ def select_driver_face(faces, frame_width):
     return best_face
 
 
-# ─────────────────────── WhatsApp SOS via CallMeBot ───────────────────────────
-def send_whatsapp_sos(phone: str, apikey: str, lat: float = 0.0, lon: float = 0.0):
-    """Send an emergency WhatsApp message via the free CallMeBot API."""
+# ─────────────────────── Telegram SOS via CallMeBot ──────────────────────────
+def send_telegram_sos(username: str, lat: float = 0.0, lon: float = 0.0):
+    """Send an emergency Telegram message via the free CallMeBot API.
+
+    One-time setup:
+      1. Open https://api2.callmebot.com/txt/login.php in your browser
+      2. Click the Telegram login button and authorize CallMeBot
+    """
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    message = (
-        "🚨 V2V EMERGENCY SOS 🚨\n"
-        "Driver is INCAPACITATED!\n"
-        f"Time: {timestamp}\n"
-    )
-    if lat != 0.0 or lon != 0.0:
-        message += f"Location: {lat:.6f}, {lon:.6f}\n"
-        message += f"Maps: https://maps.google.com/?q={lat},{lon}"
-    else:
-        message += "Location: GPS not available"
+    # Keep the message simple without special characters/newlines
+    # CallMeBot's firewall/API often rejects complex percent-encoded characters with a 403
+    message = f"V2V EMERGENCY SOS - Driver is INCAPACITATED - Time: {timestamp}"
 
-    encoded_msg = urllib.parse.quote(message)
-    url = (
-        f"https://api.callmebot.com/whatsapp.php"
-        f"?phone={phone}&text={encoded_msg}&apikey={apikey}"
-    )
+    if lat != 0.0 or lon != 0.0:
+        message += f" - Location: https://maps.google.com/?q={lat},{lon}"
+    else:
+        message += " - Location: GPS not available"
+
+    # Use quote_plus so spaces become '+', which is safer for this specific API
+    encoded_msg = urllib.parse.quote_plus(message)
+    url = f"https://api.callmebot.com/text.php?user={username}&text={encoded_msg}"
 
     try:
-        req = urllib.request.Request(url)
-        response = urllib.request.urlopen(req, timeout=10)
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        })
+        response = urllib.request.urlopen(req, timeout=15, context=SSL_CTX)
         status = response.getcode()
-        print(f"[WHATSAPP] SOS sent to {phone} (HTTP {status})")
+        print(f"[TELEGRAM] SOS sent to {username} (HTTP {status})")
         return True
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            print(f"[TELEGRAM] Failed — HTTP 403 Forbidden.")
+            print(f"[TELEGRAM] You must authorize first: https://api2.callmebot.com/txt/login.php")
+        else:
+            print(f"[TELEGRAM] Failed — HTTP {e.code}")
+        return False
     except Exception as e:
-        print(f"[WHATSAPP] ERROR sending to {phone}: {e}")
+        print(f"[TELEGRAM] ERROR: {e}")
         return False
 
 
@@ -246,8 +261,8 @@ def main():
         help="Seconds without driver face before alert (default: 4.0)"
     )
     parser.add_argument(
-        "--whatsapp-apikey", type=str, default=None,
-        help="CallMeBot API key for WhatsApp SOS messages"
+        "--telegram-user", type=str, default="@Lakshay010104",
+        help="Telegram username for CallMeBot SOS messages (default: @Lakshay010104)"
     )
     parser.add_argument(
         "--shape-predictor", type=str,
@@ -298,11 +313,11 @@ def main():
     driver_last_seen_time = time.time()
     head_down_alert_sent = False
 
-    # WhatsApp status
-    if args.whatsapp_apikey:
-        print(f"[INIT] WhatsApp SOS enabled → {EMERGENCY_PHONE}")
+    # Telegram status
+    if args.telegram_user:
+        print(f"[INIT] Telegram SOS enabled → {args.telegram_user}")
     else:
-        print("[INIT] WhatsApp SOS disabled (no --whatsapp-apikey provided)")
+        print("[INIT] Telegram SOS disabled (no --telegram-user provided)")
 
     print(f"[INIT] Thresholds: DROWSY={args.closed_seconds}s  SOS={args.sos_seconds}s")
     print("[INIT] Drowsiness detector running. Press 'q' to quit.")
@@ -484,17 +499,16 @@ def main():
                     # Tell ESP32 to go directly into SOS mode
                     bridge.send_sos_trigger()
 
-                    # Send WhatsApp message
-                    if args.whatsapp_apikey:
-                        print("[SOS] Sending WhatsApp SOS message...")
-                        send_whatsapp_sos(
-                            phone=EMERGENCY_PHONE,
-                            apikey=args.whatsapp_apikey,
+                    # Send Telegram message
+                    if args.telegram_user:
+                        print("[SOS] Sending Telegram SOS message...")
+                        send_telegram_sos(
+                            username=args.telegram_user,
                             lat=bridge.last_lat,
                             lon=bridge.last_lon,
                         )
                     else:
-                        print("[SOS] WhatsApp not configured (--whatsapp-apikey not set)")
+                        print("[SOS] Telegram not configured (--telegram-user not set)")
 
                 # Show SOS countdown on screen
                 if total_sleep > args.closed_seconds and not sos_triggered:

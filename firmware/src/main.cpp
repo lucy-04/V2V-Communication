@@ -84,6 +84,11 @@ static const uint32_t OLED_ALERT_DISPLAY_MS = 3000;
 // Earth radius in metres
 static const float EARTH_RADIUS_M = 6371000.0f;
 
+// Fallback GPS coordinates (used when GPS module has no satellite fix)
+// Default: New Delhi, India — change these to your actual location
+static const float FALLBACK_LAT = 28.6139f;
+static const float FALLBACK_LON = 77.2090f;
+
 // === [ NETWORK PACKET STRUCTURES (Max 32 Bytes) ] ===
 struct __attribute__((packed)) NormalPacket
 {
@@ -159,8 +164,9 @@ struct RawPacket
 RingBuffer<RawPacket, 16> rxRingBuffer;
 
 // Own-vehicle state (written Core 0, read Core 1)
-static volatile float ownLat = 0.0f;
-static volatile float ownLon = 0.0f;
+static volatile float ownLat = FALLBACK_LAT;
+static volatile float ownLon = FALLBACK_LON;
+static volatile bool  gpsHasFix = false;  // true once we get a real satellite fix
 static volatile uint16_t ownSpeed = 0;
 static volatile uint8_t ownTurn = 0;
 
@@ -498,8 +504,15 @@ void taskGPS(void *pvParameters)
 
             if (gpsFix.valid.location)
             {
-                ownLat = gpsFix.latitude();
-                ownLon = gpsFix.longitude();
+                float lat = gpsFix.latitude();
+                float lon = gpsFix.longitude();
+                // Only accept real coordinates (reject 0.0/0.0 as invalid)
+                if (lat != 0.0f || lon != 0.0f)
+                {
+                    ownLat = lat;
+                    ownLon = lon;
+                    gpsHasFix = true;
+                }
             }
             if (gpsFix.valid.speed)
             {
@@ -933,10 +946,10 @@ void taskOLED(void *pvParameters)
             oled.print(myVehicleID);
 
             oled.setCursor(80, 0);
-            if (ownLat != 0.0f || ownLon != 0.0f)
+            if (gpsHasFix)
                 oled.print("GPS:OK");
             else
-                oled.print("GPS:--");
+                oled.print("GPS:FB");  // FB = fallback coords
 
             oled.drawLine(0, 10, OLED_WIDTH, 10, SSD1306_WHITE);
 
