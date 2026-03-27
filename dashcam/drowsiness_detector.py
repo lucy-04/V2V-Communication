@@ -5,7 +5,7 @@ V2V Drowsiness Detection — Smart Dashcam Simulator
 Captures webcam frames, detects the DRIVER's face (rightmost-closest person)
 via dlib's 68-point predictor, computes Eye Aspect Ratio (EAR), and sends
 ``DROWSY_ALERT`` over serial to the ESP32 when:
-  1. The driver's eyes are closed for too many consecutive frames, OR
+  1. The driver's eyes are closed for more than 3 seconds (time-based), OR
   2. The driver's head drops out of frame for > 4 seconds (face lost).
 
 Usage:
@@ -16,7 +16,7 @@ Usage:
     python drowsiness_detector.py --no-serial
 
     # Custom thresholds
-    python drowsiness_detector.py --ear-threshold 0.22 --consec-frames 25
+    python drowsiness_detector.py --ear-threshold 0.22 --closed-seconds 3.0
 """
 
 import argparse
@@ -208,9 +208,9 @@ def main():
         help="EAR threshold below which eyes are considered closed (default: 0.25)"
     )
     parser.add_argument(
-        "--consec-frames", type=int, default=20,
-        help="Number of consecutive frames below EAR threshold to trigger alert "
-             "(default: 20, ~0.7s at 30fps)"
+        "--closed-seconds", type=float, default=3.0,
+        help="Seconds eyes must be continuously closed to trigger alert "
+             "(default: 3.0)"
     )
     parser.add_argument(
         "--cooldown", type=float, default=5.0,
@@ -259,7 +259,7 @@ def main():
     )
 
     # ── State ──
-    consec_counter = 0              # consecutive frames with EAR below threshold
+    eyes_closed_since = None        # timestamp when eyes first closed (None = open)
     last_alert_time = 0.0           # timestamp of last DROWSY_ALERT sent
     alert_active = False
     alert_reason = ""
@@ -347,11 +347,14 @@ def main():
                 cv2.drawContours(frame, [left_hull],  -1, GREEN, 1)
                 cv2.drawContours(frame, [right_hull], -1, GREEN, 1)
 
-                # ── Drowsiness logic (eyes closed) ──
+                # ── Drowsiness logic (time-based: eyes closed for N seconds) ──
                 if avg_ear < args.ear_threshold:
-                    consec_counter += 1
+                    if eyes_closed_since is None:
+                        eyes_closed_since = now  # mark when eyes first closed
 
-                    if consec_counter >= args.consec_frames:
+                    closed_duration = now - eyes_closed_since
+
+                    if closed_duration >= args.closed_seconds:
                         if now - last_alert_time > args.cooldown:
                             bridge.send_alert()
                             last_alert_time = now
@@ -363,8 +366,16 @@ def main():
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                             0.7, RED, 2
                         )
+                    elif closed_duration > 1.0:
+                        # Warning: eyes closing but not yet at threshold
+                        remaining = args.closed_seconds - closed_duration
+                        cv2.putText(
+                            frame, f"Eyes closing... ({remaining:.1f}s to alert)",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, ORANGE, 2
+                        )
                 else:
-                    consec_counter = 0
+                    eyes_closed_since = None  # eyes opened — reset timer
                     if alert_reason == "EYES CLOSED":
                         alert_active = False
                         alert_reason = ""
@@ -379,7 +390,7 @@ def main():
 
             else:
                 # ── No driver face detected — possible head-down ──
-                consec_counter = 0   # reset EAR counter since we can't see eyes
+                eyes_closed_since = None  # reset timer since we can't see eyes
                 elapsed_missing = now - driver_last_seen_time
 
                 if elapsed_missing >= args.head_down_timeout:
