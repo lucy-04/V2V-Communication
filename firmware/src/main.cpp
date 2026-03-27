@@ -21,12 +21,13 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <stdint.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <RF24.h>
 #include <NMEAGPS.h>
 
-// ─────────────────────────── PIN DEFINITIONS ────────────────────────────────
+// === [ HARDWARE PIN DEFINITIONS ] ===
 #define NRF_CE_PIN 4
 #define NRF_CSN_PIN 5
 
@@ -44,7 +45,7 @@
 #define LED_GRN_PIN 27
 #define LED_BLU_PIN 14
 
-// ─────────────────────────── CONSTANTS ──────────────────────────────────────
+// === [ SYSTEM CONSTANTS & THRESHOLDS ] ===
 static const uint64_t RF_PIPE_ADDR = 0xF0F0F0F0E1LL;
 static const uint8_t RF_CHANNEL = 108;
 static const uint32_t NORMAL_TX_INTERVAL_MS = 1000;
@@ -54,7 +55,7 @@ static const uint32_t ALERT_DURATION_MS = 2000;
 static const uint32_t SERIAL_POLL_INTERVAL = 50;
 static const uint32_t DROWSY_ALERT_REARM_MS = 5000;
 
-// CSMA / Jitter / Channel Hopping
+// -> CSMA-CA, Random Jitter & Multi-Channel Hopping Constants
 static const uint32_t TX_JITTER_MAX_MS = 200;
 static const uint8_t CSMA_CARRIER_SENSE_US = 130;
 static const uint8_t CSMA_MAX_BACKOFF_TRIES = 5;
@@ -83,7 +84,7 @@ static const uint32_t OLED_ALERT_DISPLAY_MS = 3000;
 // Earth radius in metres
 static const float EARTH_RADIUS_M = 6371000.0f;
 
-// ─────────────────────────── PACKET STRUCTURES (packed, ≤32 B) ─────────────
+// === [ NETWORK PACKET STRUCTURES (Max 32 Bytes) ] ===
 struct __attribute__((packed)) NormalPacket
 {
     uint8_t packetType;    // 0
@@ -107,7 +108,7 @@ struct __attribute__((packed)) EmergencyPacket
 };
 static_assert(sizeof(EmergencyPacket) <= 32, "EmergencyPacket exceeds 32-byte NRF limit");
 
-// ─────────────────────── GENERIC RING BUFFER (lock-free SPSC) ──────────────
+// === [ LOCK-FREE SPSC RING BUFFER ] ===
 template <typename T, uint8_t N>
 class RingBuffer
 {
@@ -142,7 +143,7 @@ private:
     T buf_[N];
 };
 
-// ─────────────────────────── GLOBAL STATE ───────────────────────────────────
+// === [ GLOBAL STATE & OBJECTS ] ===
 RF24 radio(NRF_CE_PIN, NRF_CSN_PIN);
 
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
@@ -219,7 +220,7 @@ static volatile uint32_t oledAlertStart = 0;
 static volatile float oledLastDist = 0.0f;
 static volatile float oledLastTTC = 999.0f;
 
-// ─────────────────── MATH ──────────────────────────────────────────────────
+// === [ MATHEMATICAL UTILITIES ] ===
 static float approxDistanceM(float lat1, float lon1, float lat2, float lon2)
 {
     float dLat = radians(lat2 - lat1);
@@ -234,7 +235,7 @@ static float computeTTC(float distance, float closingSpeedMs)
     return distance / closingSpeedMs;
 }
 
-// ─────────────────── CSMA: CARRIER SENSE ───────────────────────────────────
+// === [ CARRIER SENSE MULTIPLE ACCESS (CSMA) ] ===
 static bool isChannelClear()
 {
     radio.startListening();
@@ -242,7 +243,7 @@ static bool isChannelClear()
     return !radio.testCarrier();
 }
 
-// ─────────────────── DUPLICATE SUPPRESSION ─────────────────────────────────
+// === [ PACKET DUPLICATE SUPPRESSION ] ===
 static bool isDuplicate(uint8_t vid, uint16_t pid)
 {
     uint32_t now = millis();
@@ -260,7 +261,7 @@ static bool isDuplicate(uint8_t vid, uint16_t pid)
     return false;
 }
 
-// ─────── EMERGENCY MULTI-CHANNEL TRANSMIT ──────────────────────────────────
+// === [ EMERGENCY BROADCAST LOGIC ] ===
 static void sendEmergencyMultiChannel(const EmergencyPacket &pkt)
 {
     for (uint8_t ch = 0; ch < NUM_EMERGENCY_CHANNELS; ch++)
@@ -276,7 +277,7 @@ static void sendEmergencyMultiChannel(const EmergencyPacket &pkt)
     radio.startListening();
 }
 
-// ──────────────────── ALERT SYSTEM (non-blocking) ──────────────────────────
+// === [ HARDWARE ALERT CONTROLLER (Non-blocking) ] ===
 static void fireAlert()
 {
     alertActiveUntil = millis() + ALERT_DURATION_MS;
@@ -296,7 +297,7 @@ static void updateAlerts()
     }
 }
 
-// ── Helper: set OLED alert overlay text ────────────────────────────────────
+// -> Helper: Push text to the OLED alert overlay
 static void setOledAlert(const char *text)
 {
     strncpy((char *)oledAlertText, text, sizeof(oledAlertText) - 1);
@@ -304,7 +305,7 @@ static void setOledAlert(const char *text)
     oledAlertStart = millis();
 }
 
-// ──────────── DROWSY WAKE-UP STATE MACHINE (non-blocking) ──────────────────
+// === [ DROWSY WAKE-UP STATE MACHINE ] ===
 static void updateDrowsyWakeup()
 {
     if (drowsyState == 0)
@@ -373,7 +374,7 @@ static void updateDrowsyWakeup()
     }
 }
 
-// ─────── Start incapacitation countdown ────────────────────────────────────
+// === [ INCAPACITATION COUNTDOWN TIMER ] ===
 static void startIncapTimer()
 {
     if (!incapTimerActive && !sosActive)
@@ -383,7 +384,7 @@ static void startIncapTimer()
     }
 }
 
-// ──────────── INCAPACITATION / SOS STATE MACHINE (non-blocking) ────────────
+// === [ SOS & INCAPACITATION BEACON SYSTEM ] ===
 static void updateIncapSos()
 {
     uint32_t now = millis();
@@ -447,7 +448,7 @@ static void updateIncapSos()
     }
 }
 
-// ────────────────── SERIAL LOGGING FOR EMERGENCY RESPONDERS ────────────────
+// === [ EMERGENCY RESPONDER TELEMETRY LOGS ] ===
 static void logCollisionToSerial(float lat, float lon, uint8_t eventCode)
 {
     Serial.println("========== EMERGENCY EVENT ==========");
@@ -477,9 +478,10 @@ static void logCollisionToSerial(float lat, float lon, uint8_t eventCode)
     Serial.println("======================================");
 }
 
-/*============================================================================
- *  CORE 0 TASKS — GPS & Serial Listener
- *==========================================================================*/
+// =========================================================================
+//                           CORE 0 TASKS
+//                   (GPS Parsing & Serial Listener)
+// =========================================================================
 
 void taskGPS(void *pvParameters)
 {
@@ -573,9 +575,10 @@ void taskSerialListener(void *pvParameters)
     }
 }
 
-/*============================================================================
- *  CORE 1 TASKS — RF TX/RX & Risk Assessment
- *==========================================================================*/
+// =========================================================================
+//                           CORE 1 TASKS
+//                   (RF Transmit/Receive & Risk Assessment)
+// =========================================================================
 
 void taskRFTransmit(void *pvParameters)
 {
@@ -837,9 +840,9 @@ void taskRiskAssessment(void *pvParameters)
     }
 }
 
-/*============================================================================
- *  OLED DISPLAY TASK
- *==========================================================================*/
+// =========================================================================
+//                           OLED DISPLAY TASK
+// =========================================================================
 
 void taskOLED(void *pvParameters)
 {
@@ -1040,9 +1043,9 @@ void taskOLED(void *pvParameters)
     }
 }
 
-/*============================================================================
- *  SETUP & LOOP
- *==========================================================================*/
+// =========================================================================
+//                           SETUP & LOOP
+// =========================================================================
 void setup()
 {
     Serial.begin(115200);
