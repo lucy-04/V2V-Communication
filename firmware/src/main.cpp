@@ -5,21 +5,17 @@
  * Hardware: ESP32 + NRF24L01 + NEO-6M GPS + SSD1306 OLED + Buzzer + LEDs
  *
  * Architecture
- *   Core 0 → GPS UART parsing, Serial listener (DROWSY_ALERT from laptop)
+ *   Core 0 → GPS UART parsing, Serial listener, OLED display
  *   Core 1 → RF TX/RX, risk-assessment math, GPIO alerts
  *
  * Display
  *   • 128×64 SSD1306 OLED (I2C) shows all system status
- *   • Serial is reserved for Python script commands only
+ *   • Serial is reserved for Python script commands + emergency logs
  *
  * Coding rules
  *   • NO delay()  — millis()-based non-blocking timers only
  *   • Packed structs ≤ 32 bytes (NRF24L01 hard limit)
  *   • Circular ring buffer for inbound RF packets
- *
- * Debug mode
- *   • All values printed to Serial for hardware validation
- *   • Prefix tags: [GPS] [TX] [RX] [CSMA] [RISK] [SOS] [DROWSY] [CMD] [SYS]
  ******************************************************************************/
 
 #include <Arduino.h>
@@ -28,79 +24,74 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <RF24.h>
-#include <NMEAGPS.h> // NeoGPS — fast, memory-efficient NMEA parser
+#include <NMEAGPS.h>
 
 // ─────────────────────────── PIN DEFINITIONS ────────────────────────────────
-// NRF24L01 (VSPI — default SPI bus on ESP32)
 #define NRF_CE_PIN 4
 #define NRF_CSN_PIN 5
 
-// NEO-6M GPS (UART2)
-#define GPS_RX_PIN 16 // ESP32 RX ← GPS TX
-#define GPS_TX_PIN 17 // ESP32 TX → GPS RX (not used, but wired)
+#define GPS_RX_PIN 16
+#define GPS_TX_PIN 17
 
-// SSD1306 OLED (I2C — default ESP32 I2C bus)
 #define OLED_SDA_PIN 21
 #define OLED_SCL_PIN 22
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
 #define OLED_I2C_ADDR 0x3C
 
-// Alert GPIOs
 #define BUZZER_PIN 25
 #define LED_RED_PIN 26
 #define LED_GRN_PIN 27
 #define LED_BLU_PIN 14
 
 // ─────────────────────────── CONSTANTS ──────────────────────────────────────
-static const uint64_t RF_PIPE_ADDR = 0xF0F0F0F0E1LL; // shared broadcast pipe
-static const uint8_t RF_CHANNEL = 108;               // 2.508 GHz — low Wi-Fi overlap
-static const uint32_t NORMAL_TX_INTERVAL_MS = 1000;  // 1 Hz telemetry (base, before jitter)
-static const float ALERT_DISTANCE_M = 50.0f;         // proximity threshold
-static const float ALERT_TTC_S = 3.0f;               // time-to-collision threshold
-static const uint32_t ALERT_DURATION_MS = 2000;      // buzzer/LED on-time per trigger
-static const uint32_t SERIAL_POLL_INTERVAL = 50;     // ms between Serial checks
-static const uint32_t DROWSY_ALERT_REARM_MS = 5000;  // cooldown before another drowsy alert
+static const uint64_t RF_PIPE_ADDR = 0xF0F0F0F0E1LL;
+static const uint8_t RF_CHANNEL = 108;
+static const uint32_t NORMAL_TX_INTERVAL_MS = 1000;
+static const float ALERT_DISTANCE_M = 50.0f;
+static const float ALERT_TTC_S = 3.0f;
+static const uint32_t ALERT_DURATION_MS = 2000;
+static const uint32_t SERIAL_POLL_INTERVAL = 50;
+static const uint32_t DROWSY_ALERT_REARM_MS = 5000;
 
-// ─── CSMA / Jitter / Channel Hopping ───────────────────────────────────────
-static const uint32_t TX_JITTER_MAX_MS = 200;               // random 0-200 ms added to normal TX
-static const uint8_t CSMA_CARRIER_SENSE_US = 130;           // µs to let testCarrier() settle
-static const uint8_t CSMA_MAX_BACKOFF_TRIES = 5;            // max backoff attempts before skip
-static const uint8_t EMERGENCY_RETRANSMITS = 3;             // send emergency on each channel
-static const uint8_t EMERGENCY_CHANNELS[] = {90, 108, 120}; // channel-hop list
+// CSMA / Jitter / Channel Hopping
+static const uint32_t TX_JITTER_MAX_MS = 200;
+static const uint8_t CSMA_CARRIER_SENSE_US = 130;
+static const uint8_t CSMA_MAX_BACKOFF_TRIES = 5;
+static const uint8_t EMERGENCY_CHANNELS[] = {90, 108, 120};
 static const uint8_t NUM_EMERGENCY_CHANNELS = sizeof(EMERGENCY_CHANNELS);
-static const uint32_t EMERGENCY_HOP_GAP_US = 500; // µs between channel hops (non-blocking)
+static const uint32_t EMERGENCY_HOP_GAP_US = 500;
 
-// ─── Duplicate suppression ─────────────────────────────────────────────────
+// Duplicate suppression
 static const uint8_t DEDUP_CACHE_SIZE = 32;
 
-// Drowsy wake-up escalation — 3 stages, increasingly urgent
-static const uint8_t WAKEUP_STAGES = 3;                         // number of escalating pulses
-static const uint32_t WAKEUP_STAGE_ON_MS[3] = {300, 600, 1200}; // buzz on-time per stage
-static const uint32_t WAKEUP_STAGE_OFF_MS[3] = {700, 400, 300}; // pause between stages
-static const uint32_t WAKEUP_GRACE_MS = 1000; // extra grace period after last pulse
+// Drowsy wake-up escalation
+static const uint8_t WAKEUP_STAGES = 3;
+static const uint32_t WAKEUP_STAGE_ON_MS[3] = {300, 600, 1200};
+static const uint32_t WAKEUP_STAGE_OFF_MS[3] = {700, 400, 300};
+static const uint32_t WAKEUP_GRACE_MS = 1000;
 
 // Incapacitation / SOS beacon
-static const uint32_t INCAP_TIMEOUT_MS = 30000;      // 30 s without DRIVER_OK → SOS
-static const uint32_t SOS_BEACON_INTERVAL_MS = 2000; // re-broadcast SOS every 2 s
+static const uint32_t INCAP_TIMEOUT_MS = 30000;
+static const uint32_t SOS_BEACON_INTERVAL_MS = 2000;
 
 // OLED display
-static const uint32_t OLED_REFRESH_MS = 250;         // ~4 Hz screen refresh
-static const uint32_t OLED_PAGE_CYCLE_MS = 3000;     // auto-cycle pages every 3 s
-static const uint32_t OLED_ALERT_DISPLAY_MS = 3000;  // show alert overlay for 3 s
+static const uint32_t OLED_REFRESH_MS = 250;
+static const uint32_t OLED_PAGE_CYCLE_MS = 3000;
+static const uint32_t OLED_ALERT_DISPLAY_MS = 3000;
 
-// Earth radius in metres (for Haversine / equirectangular)
+// Earth radius in metres
 static const float EARTH_RADIUS_M = 6371000.0f;
 
 // ─────────────────────────── PACKET STRUCTURES (packed, ≤32 B) ─────────────
 struct __attribute__((packed)) NormalPacket
 {
     uint8_t packetType;    // 0
-    uint8_t vehicleID;     // unique per vehicle (set at boot from MAC)
-    uint16_t packetID;     // incrementing sequence number
-    float latitude;        // 4 B
-    float longitude;       // 4 B
-    uint16_t speed;        // 2 B  (km/h × 10 for 0.1 resolution)
+    uint8_t vehicleID;
+    uint16_t packetID;
+    float latitude;
+    float longitude;
+    uint16_t speed;        // km/h × 10
     uint8_t turnIndicator; // 0=straight, 1=left, 2=right
 };
 static_assert(sizeof(NormalPacket) <= 32, "NormalPacket exceeds 32-byte NRF limit");
@@ -108,11 +99,11 @@ static_assert(sizeof(NormalPacket) <= 32, "NormalPacket exceeds 32-byte NRF limi
 struct __attribute__((packed)) EmergencyPacket
 {
     uint8_t packetType; // 1
-    uint8_t vehicleID;  // unique per vehicle
-    uint16_t packetID;  // incrementing sequence number
-    uint8_t eventCode;  // 1=Collision, 2=Drowsy, 3=SOS (incapacitated)
-    float latitude;     // 4 B
-    float longitude;    // 4 B
+    uint8_t vehicleID;
+    uint16_t packetID;
+    uint8_t eventCode;  // 1=Collision, 2=Drowsy, 3=SOS
+    float latitude;
+    float longitude;
 };
 static_assert(sizeof(EmergencyPacket) <= 32, "EmergencyPacket exceeds 32-byte NRF limit");
 
@@ -127,7 +118,7 @@ public:
     {
         uint8_t nextHead = (head_ + 1) & (N - 1);
         if (nextHead == tail_)
-            return false; // full
+            return false;
         buf_[head_] = item;
         head_ = nextHead;
         return true;
@@ -135,7 +126,7 @@ public:
     bool pop(T &item)
     {
         if (head_ == tail_)
-            return false; // empty
+            return false;
         item = buf_[tail_];
         tail_ = (tail_ + 1) & (N - 1);
         return true;
@@ -152,32 +143,27 @@ private:
 };
 
 // ─────────────────────────── GLOBAL STATE ───────────────────────────────────
-// RF
 RF24 radio(NRF_CE_PIN, NRF_CSN_PIN);
 
-// OLED display
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 
-// GPS (NeoGPS)
-static NMEAGPS gpsParser;                   // parser instance
-static gps_fix gpsFix;                      // latest fix
-static HardwareSerial &gpsSerial = Serial2; // UART2
+static NMEAGPS gpsParser;
+static gps_fix gpsFix;
+static HardwareSerial &gpsSerial = Serial2;
 
-// Ring buffer: holds raw 32-byte blobs; we decode after pop
 struct RawPacket
 {
     uint8_t data[32];
 };
-
 RingBuffer<RawPacket, 16> rxRingBuffer;
 
-// Latest own-vehicle state (written on Core 0, read on Core 1)
+// Own-vehicle state (written Core 0, read Core 1)
 static volatile float ownLat = 0.0f;
 static volatile float ownLon = 0.0f;
-static volatile uint16_t ownSpeed = 0; // km/h × 10
-static volatile uint8_t ownTurn = 0;   // 0=straight
+static volatile uint16_t ownSpeed = 0;
+static volatile uint8_t ownTurn = 0;
 
-// ─── Debug counters ────────────────────────────────────────────────────────
+// Debug counters
 static volatile uint32_t dbgTxNormalCount = 0;
 static volatile uint32_t dbgTxEmergencyCount = 0;
 static volatile uint32_t dbgRxRawCount = 0;
@@ -186,15 +172,15 @@ static volatile uint32_t dbgRxOwnCount = 0;
 static volatile uint32_t dbgCsmaBusyCount = 0;
 static volatile uint32_t dbgGpsFixCount = 0;
 
-// ─── Packet identification ─────────────────────────────────────────────────
+// Packet identification
 static uint8_t myVehicleID = 0;
 static uint16_t txPacketID = 0;
 
-// ─── CSMA backoff state ────────────────────────────────────────────────────
+// CSMA backoff state
 static uint8_t csmaBackoffAttempt = 0;
 static uint32_t csmaBackoffUntil = 0;
 
-// ─── Duplicate suppression cache ───────────────────────────────────────────
+// Duplicate suppression cache
 struct DedupEntry
 {
     uint8_t vehicleID;
@@ -204,7 +190,7 @@ struct DedupEntry
 static DedupEntry dedupCache[DEDUP_CACHE_SIZE];
 static uint8_t dedupIdx = 0;
 
-// Flags (atomic-safe on ESP32 — single-word writes)
+// Flags
 static volatile bool emergencyDrowsy = false;
 static volatile bool emergencyCollision = false;
 
@@ -214,27 +200,26 @@ static volatile uint32_t alertActiveUntil = 0;
 // Drowsy cooldown
 static volatile uint32_t lastDrowsyTrigger = 0;
 
-// ─── Drowsy wake-up state machine ──────────────────────────────────────────
+// Drowsy wake-up state machine
 static volatile uint8_t drowsyState = 0;
 static volatile uint8_t drowsyStage = 0;
 static volatile uint32_t drowsyStateStart = 0;
 static volatile bool drowsyCancelFlag = false;
 
-// ─── Incapacitation / SOS state ────────────────────────────────────────────
+// Incapacitation / SOS state
 static volatile bool incapTimerActive = false;
 static volatile uint32_t incapTimerStart = 0;
 static volatile bool sosActive = false;
 static volatile uint32_t lastSosBeacon = 0;
 static volatile bool driverOkFlag = false;
 
-// ─── OLED display state (written by various tasks, read by OLED task) ──────
-// All fields are volatile for cross-task visibility.
-static volatile char oledAlertText[22] = "";       // alert overlay text (empty = no alert)
-static volatile uint32_t oledAlertStart = 0;       // millis() when alert was triggered
-static volatile float oledLastDist = 0.0f;         // last computed distance to nearby vehicle
-static volatile float oledLastTTC = 999.0f;        // last time-to-collision
+// OLED display state (cross-task)
+static volatile char oledAlertText[22] = "";
+static volatile uint32_t oledAlertStart = 0;
+static volatile float oledLastDist = 0.0f;
+static volatile float oledLastTTC = 999.0f;
 
-// ─────────────────── MATH: EQUIRECTANGULAR DISTANCE (fast) ─────────────────
+// ─────────────────── MATH ──────────────────────────────────────────────────
 static float approxDistanceM(float lat1, float lon1, float lat2, float lon2)
 {
     float dLat = radians(lat2 - lat1);
@@ -242,7 +227,6 @@ static float approxDistanceM(float lat1, float lon1, float lat2, float lon2)
     return EARTH_RADIUS_M * sqrtf(dLat * dLat + dLon * dLon);
 }
 
-// ─────────────────── MATH: TIME-TO-COLLISION ───────────────────────────────
 static float computeTTC(float distance, float closingSpeedMs)
 {
     if (closingSpeedMs <= 0.0f)
@@ -283,7 +267,7 @@ static void sendEmergencyMultiChannel(const EmergencyPacket &pkt)
     {
         radio.stopListening();
         radio.setChannel(EMERGENCY_CHANNELS[ch]);
-        bool ok = radio.write(&pkt, sizeof(pkt));
+        radio.write(&pkt, sizeof(pkt));
         if (ch < NUM_EMERGENCY_CHANNELS - 1)
             delayMicroseconds(EMERGENCY_HOP_GAP_US);
     }
@@ -359,7 +343,7 @@ static void updateDrowsyWakeup()
             drowsyStage++;
             if (drowsyStage >= WAKEUP_STAGES)
             {
-                drowsyState = 3; // GRACE
+                drowsyState = 3;
                 drowsyStateStart = now;
             }
             else
@@ -464,7 +448,6 @@ static void updateIncapSos()
 }
 
 // ────────────────── SERIAL LOGGING FOR EMERGENCY RESPONDERS ────────────────
-// Kept on Serial — these are critical logs the laptop captures for emergency services.
 static void logCollisionToSerial(float lat, float lon, uint8_t eventCode)
 {
     Serial.println("========== EMERGENCY EVENT ==========");
@@ -515,20 +498,10 @@ void taskGPS(void *pvParameters)
             {
                 ownLat = gpsFix.latitude();
                 ownLon = gpsFix.longitude();
-                locUpdated = true;
             }
             if (gpsFix.valid.speed)
             {
                 ownSpeed = (uint16_t)(gpsFix.speed_kph() * 10.0f);
-                spdUpdated = true;
-            }
-
-            // Update GPS fix count (no logging to serial)
-            uint32_t now = millis();
-            if (now - lastGpsLog >= 2000)
-            {
-                lastGpsLog = now;
-                dbgGpsFixCount++;
             }
 
             uint32_t now = millis();
@@ -581,9 +554,8 @@ void taskSerialListener(void *pvParameters)
                     if (now - lastDrowsyTrigger > DROWSY_ALERT_REARM_MS)
                     {
                         lastDrowsyTrigger = now;
-                        // Buzzer ON immediately — driver hears it right away
                         drowsyStage = 0;
-                        drowsyState = 1; // WAKEUP_ON
+                        drowsyState = 1;
                         drowsyStateStart = now;
                         drowsyCancelFlag = false;
                         digitalWrite(BUZZER_PIN, HIGH);
@@ -677,13 +649,14 @@ void taskRFTransmit(void *pvParameters)
                 pkt.turnIndicator = ownTurn;
 
                 radio.stopListening();
-                bool ok = radio.write(&pkt, sizeof(pkt));
+                radio.write(&pkt, sizeof(pkt));
                 radio.startListening();
                 dbgTxNormalCount++;
             }
             else
             {
                 // Channel busy — exponential backoff
+                dbgCsmaBusyCount++;
                 csmaBackoffAttempt++;
 
                 if (csmaBackoffAttempt >= CSMA_MAX_BACKOFF_TRIES)
@@ -788,7 +761,6 @@ void taskRiskAssessment(void *pvParameters)
 
                 if (isDuplicate(pkt.vehicleID, pkt.packetID))
                     continue;
-                }
 
                 float dist = approxDistanceM(ownLat, ownLon, pkt.latitude, pkt.longitude);
 
@@ -804,27 +776,6 @@ void taskRiskAssessment(void *pvParameters)
 
                 float ttc = computeTTC(dist, closingSpeedMs);
 
-                // Log every received normal packet with full detail
-                Serial.print("[RISK] Normal from vID=");
-                Serial.print(pkt.vehicleID);
-                Serial.print(" pktID=");
-                Serial.print(pkt.packetID);
-                Serial.print(" lat=");
-                Serial.print(pkt.latitude, 6);
-                Serial.print(" lon=");
-                Serial.print(pkt.longitude, 6);
-                Serial.print(" spd=");
-                Serial.print(pkt.speed / 10.0f, 1);
-                Serial.print("km/h turn=");
-                Serial.print(pkt.turnIndicator);
-                Serial.print(" | dist=");
-                Serial.print(dist, 1);
-                Serial.print("m closing=");
-                Serial.print(closingSpeedMs, 2);
-                Serial.print("m/s TTC=");
-                Serial.print(ttc, 1);
-                Serial.println("s");
-
                 // Update OLED display state
                 oledLastDist = dist;
                 oledLastTTC = ttc;
@@ -836,7 +787,6 @@ void taskRiskAssessment(void *pvParameters)
 
                     if (ttc < 1.5f && dist < 30.0f)
                     {
-                        Serial.println("[RISK] !!! IMMINENT COLLISION — triggering emergency");
                         emergencyCollision = true;
                         logCollisionToSerial(ownLat, ownLon, 1);
                         setOledAlert("!! COLLISION !!");
@@ -860,7 +810,6 @@ void taskRiskAssessment(void *pvParameters)
                     continue;
                 }
 
-                // Buzzer beeps immediately for any incoming emergency
                 fireAlert();
 
                 switch (pkt.eventCode)
@@ -869,7 +818,6 @@ void taskRiskAssessment(void *pvParameters)
                     setOledAlert("RX: COLLISION!");
                     break;
                 case 2:
-                    // Drowsy alert from another vehicle — immediate buzzer
                     setOledAlert("RX: DROWSY!");
                     break;
                 case 3:
@@ -893,8 +841,6 @@ void taskRiskAssessment(void *pvParameters)
  *  OLED DISPLAY TASK
  *==========================================================================*/
 
-// Renders system status on the 128×64 OLED.  Cycles through pages automatically.
-// When an alert is active, shows a full-screen alert overlay instead.
 void taskOLED(void *pvParameters)
 {
     (void)pvParameters;
@@ -918,13 +864,12 @@ void taskOLED(void *pvParameters)
         oled.clearDisplay();
         oled.setTextColor(SSD1306_WHITE);
 
-        // ── Check for alert overlay ──
+        // Check for alert overlay
         bool alertActive = (oledAlertText[0] != '\0') &&
                            (now - oledAlertStart < OLED_ALERT_DISPLAY_MS);
 
         if (alertActive)
         {
-            // Full-screen alert with large text
             oled.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SSD1306_WHITE);
             oled.drawRect(2, 2, OLED_WIDTH - 4, OLED_HEIGHT - 4, SSD1306_WHITE);
 
@@ -933,26 +878,25 @@ void taskOLED(void *pvParameters)
             oled.print("!! ALERT !!");
 
             oled.setTextSize(1);
-            // Centre the alert text
             int16_t textLen = strlen((const char *)oledAlertText);
             int16_t xPos = (OLED_WIDTH - textLen * 6) / 2;
-            if (xPos < 4) xPos = 4;
+            if (xPos < 4)
+                xPos = 4;
             oled.setCursor(xPos, 28);
             oled.print((const char *)oledAlertText);
 
-            // Show distance if available
             if (oledLastDist < 500.0f)
             {
                 char buf[22];
                 snprintf(buf, sizeof(buf), "Dist:%.0fm TTC:%.1fs", (double)oledLastDist, (double)oledLastTTC);
                 textLen = strlen(buf);
                 xPos = (OLED_WIDTH - textLen * 6) / 2;
-                if (xPos < 4) xPos = 4;
+                if (xPos < 4)
+                    xPos = 4;
                 oled.setCursor(xPos, 44);
                 oled.print(buf);
             }
 
-            // Clear alert text when expired
             if (now - oledAlertStart >= OLED_ALERT_DISPLAY_MS)
             {
                 ((char *)oledAlertText)[0] = '\0';
@@ -960,7 +904,6 @@ void taskOLED(void *pvParameters)
         }
         else
         {
-            // ── Normal page display ──
             // Auto-cycle pages
             if (now - lastPageSwitch >= OLED_PAGE_CYCLE_MS)
             {
@@ -968,13 +911,12 @@ void taskOLED(void *pvParameters)
                 currentPage = (currentPage + 1) % NUM_PAGES;
             }
 
-            // Header bar (always shown)
+            // Header bar
             oled.setTextSize(1);
             oled.setCursor(0, 0);
             oled.print("V2V ID:");
             oled.print(myVehicleID);
 
-            // GPS fix indicator
             oled.setCursor(80, 0);
             if (ownLat != 0.0f || ownLon != 0.0f)
                 oled.print("GPS:OK");
@@ -985,7 +927,7 @@ void taskOLED(void *pvParameters)
 
             switch (currentPage)
             {
-            case 0: // ── Page: Status Overview ──
+            case 0: // Status Overview
             {
                 oled.setCursor(0, 13);
                 oled.print("Spd: ");
@@ -1007,7 +949,6 @@ void taskOLED(void *pvParameters)
                 oled.print(ESP.getFreeHeap() / 1024);
                 oled.print("k");
 
-                // Status line
                 oled.setCursor(0, 55);
                 if (sosActive)
                     oled.print("!! SOS ACTIVE !!");
@@ -1018,13 +959,12 @@ void taskOLED(void *pvParameters)
                 else
                     oled.print("System OK");
 
-                // Page indicator
                 oled.setCursor(110, 55);
                 oled.print("1/3");
                 break;
             }
 
-            case 1: // ── Page: RF Statistics ──
+            case 1: // RF Statistics
             {
                 oled.setCursor(0, 13);
                 oled.print("TX norm: ");
@@ -1053,7 +993,7 @@ void taskOLED(void *pvParameters)
                 break;
             }
 
-            case 2: // ── Page: Nearby Vehicles ──
+            case 2: // Nearby Vehicles
             {
                 oled.setCursor(0, 13);
                 oled.print("Nearest dist:");
@@ -1105,23 +1045,22 @@ void taskOLED(void *pvParameters)
  *==========================================================================*/
 void setup()
 {
-    // ── Serial (USB — reserved for Python script commands) ──
     Serial.begin(115200);
     while (!Serial)
     {
         ;
     }
 
-    // ── Vehicle ID from ESP32 MAC ──
+    // Vehicle ID from ESP32 MAC
     uint8_t mac[6];
     esp_efuse_mac_get_default(mac);
     myVehicleID = mac[5];
     randomSeed(mac[4] ^ (millis() & 0xFF));
 
-    // ── Initialise dedup cache ──
+    // Initialise dedup cache
     memset(dedupCache, 0, sizeof(dedupCache));
 
-    // ── GPIO ──
+    // GPIO
     pinMode(BUZZER_PIN, OUTPUT);
     pinMode(LED_RED_PIN, OUTPUT);
     pinMode(LED_GRN_PIN, OUTPUT);
@@ -1134,11 +1073,10 @@ void setup()
     // Quick LED self-test
     digitalWrite(LED_GRN_PIN, HIGH);
 
-    // ── OLED Display ──
+    // OLED Display
     Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
     if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR))
     {
-        // OLED failed — blink blue to indicate, but continue (non-fatal)
         for (int i = 0; i < 6; i++)
         {
             digitalWrite(LED_BLU_PIN, !digitalRead(LED_BLU_PIN));
@@ -1157,10 +1095,9 @@ void setup()
     oled.println("Booting...");
     oled.display();
 
-    // ── NRF24L01 ──
+    // NRF24L01
     if (!radio.begin())
     {
-        // Show error on OLED
         oled.clearDisplay();
         oled.setCursor(0, 20);
         oled.setTextSize(1);
@@ -1195,53 +1132,15 @@ void setup()
     oled.println("Launching tasks...");
     oled.display();
 
-    // ── FreeRTOS Task Creation ──
-    // Core 0: GPS + Serial Listener
-    xTaskCreatePinnedToCore(
-        taskGPS,
-        "GPS_Parse",
-        4096,
-        NULL,
-        2,
-        NULL,
-        0);
-
-    xTaskCreatePinnedToCore(
-        taskSerialListener,
-        "Serial_Listen",
-        4096,
-        NULL,
-        1,
-        NULL,
-        0);
+    // FreeRTOS Task Creation
+    // Core 0: GPS + Serial Listener + OLED
+    xTaskCreatePinnedToCore(taskGPS, "GPS_Parse", 4096, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(taskSerialListener, "Serial_Listen", 4096, NULL, 1, NULL, 0);
 
     // Core 1: RF TX, RF RX, Risk Assessment
-    xTaskCreatePinnedToCore(
-        taskRFTransmit,
-        "RF_TX",
-        4096,
-        NULL,
-        3,
-        NULL,
-        1);
-
-    xTaskCreatePinnedToCore(
-        taskRFReceive,
-        "RF_RX",
-        4096,
-        NULL,
-        3,
-        NULL,
-        1);
-
-    xTaskCreatePinnedToCore(
-        taskRiskAssessment,
-        "Risk_Assess",
-        4096,
-        NULL,
-        2,
-        NULL,
-        1);
+    xTaskCreatePinnedToCore(taskRFTransmit, "RF_TX", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(taskRFReceive, "RF_RX", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(taskRiskAssessment, "Risk_Assess", 4096, NULL, 2, NULL, 1);
 
     // Drowsy wake-up state machine — Core 1
     xTaskCreatePinnedToCore(
@@ -1253,12 +1152,7 @@ void setup()
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
         },
-        "Drowsy_Wake",
-        2048,
-        NULL,
-        2,
-        NULL,
-        1);
+        "Drowsy_Wake", 2048, NULL, 2, NULL, 1);
 
     // Incapacitation / SOS beacon — Core 1
     xTaskCreatePinnedToCore(
@@ -1270,31 +1164,17 @@ void setup()
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
         },
-        "Incap_SOS",
-        2048,
-        NULL,
-        3,
-        NULL,
-        1);
+        "Incap_SOS", 2048, NULL, 3, NULL, 1);
 
-    // OLED display task — Core 0 (I2C runs on same core as GPS/Serial)
-    xTaskCreatePinnedToCore(
-        taskOLED,
-        "OLED_Display",
-        4096,
-        NULL,
-        1, // low priority — display is not time-critical
-        NULL,
-        0);
+    // OLED display task — Core 0
+    xTaskCreatePinnedToCore(taskOLED, "OLED_Display", 4096, NULL, 1, NULL, 0);
 
-    digitalWrite(LED_GRN_PIN, LOW); // end self-test blink
+    digitalWrite(LED_GRN_PIN, LOW);
 }
 
-// Arduino loop() is essentially idle — all real work is in FreeRTOS tasks.
 void loop()
 {
     static uint32_t lastHeartbeat = 0;
-    static uint32_t lastStatusDump = 0;
     uint32_t now = millis();
 
     if (now - lastHeartbeat >= 2000)
@@ -1305,57 +1185,5 @@ void loop()
     if (now - lastHeartbeat >= 100 && digitalRead(LED_GRN_PIN))
     {
         digitalWrite(LED_GRN_PIN, LOW);
-    }
-
-    // ── Periodic status dump every 10 s ──
-    if (now - lastStatusDump >= 10000)
-    {
-        lastStatusDump = now;
-        Serial.println("────────────── [SYS] STATUS DUMP ──────────────");
-        Serial.print("  Uptime: ");
-        Serial.print(now / 1000);
-        Serial.println("s");
-        Serial.print("  Free heap: ");
-        Serial.print(ESP.getFreeHeap());
-        Serial.println(" bytes");
-        Serial.print("  GPS: lat=");
-        Serial.print(ownLat, 6);
-        Serial.print(" lon=");
-        Serial.print(ownLon, 6);
-        Serial.print(" speed=");
-        Serial.print(ownSpeed / 10.0f, 1);
-        Serial.print("km/h fixes=");
-        Serial.println(dbgGpsFixCount);
-        Serial.print("  TX: normal=");
-        Serial.print(dbgTxNormalCount);
-        Serial.print(" emergency=");
-        Serial.print(dbgTxEmergencyCount);
-        Serial.print(" nextPktID=");
-        Serial.println(txPacketID);
-        Serial.print("  RX: raw=");
-        Serial.print(dbgRxRawCount);
-        Serial.print(" dup=");
-        Serial.print(dbgRxDupCount);
-        Serial.print(" own=");
-        Serial.print(dbgRxOwnCount);
-        Serial.print(" bufUsed=");
-        Serial.println(rxRingBuffer.count());
-        Serial.print("  CSMA: busyEvents=");
-        Serial.println(dbgCsmaBusyCount);
-        Serial.print("  State: drowsy=");
-        Serial.print(drowsyState);
-        Serial.print(" incapTimer=");
-        Serial.print(incapTimerActive ? "ON" : "OFF");
-        Serial.print(" SOS=");
-        Serial.println(sosActive ? "ON" : "OFF");
-        Serial.print("  GPIO: buzzer=");
-        Serial.print(digitalRead(BUZZER_PIN) ? "ON" : "OFF");
-        Serial.print(" red=");
-        Serial.print(digitalRead(LED_RED_PIN) ? "ON" : "OFF");
-        Serial.print(" grn=");
-        Serial.print(digitalRead(LED_GRN_PIN) ? "ON" : "OFF");
-        Serial.print(" blu=");
-        Serial.println(digitalRead(LED_BLU_PIN) ? "ON" : "OFF");
-        Serial.println("───────────────────────────────────────────────");
     }
 }
