@@ -797,7 +797,7 @@ void taskRiskAssessment(void *pvParameters)
 
                 if (dist < ALERT_DISTANCE_M || ttc < ALERT_TTC_S)
                 {
-                    fireAlert();
+                    // fireAlert();
                     setOledAlert("PROXIMITY ALERT!");
 
                     if (ttc < 1.5f && dist < 30.0f)
