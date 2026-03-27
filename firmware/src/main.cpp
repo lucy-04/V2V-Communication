@@ -2,11 +2,15 @@
  * V2V Communication System — ESP32 Firmware
  * ===========================================================================
  * Decentralised, offline Vehicle-to-Vehicle safety system.
- * Hardware: ESP32 + NRF24L01 + NEO-6M GPS + Buzzer + LEDs
+ * Hardware: ESP32 + NRF24L01 + NEO-6M GPS + SSD1306 OLED + Buzzer + LEDs
  *
  * Architecture
  *   Core 0 → GPS UART parsing, Serial listener (DROWSY_ALERT from laptop)
  *   Core 1 → RF TX/RX, risk-assessment math, GPIO alerts
+ *
+ * Display
+ *   • 128×64 SSD1306 OLED (I2C) shows all system status
+ *   • Serial is reserved for Python script commands only
  *
  * Coding rules
  *   • NO delay()  — millis()-based non-blocking timers only
@@ -20,6 +24,9 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <RF24.h>
 #include <NMEAGPS.h> // NeoGPS — fast, memory-efficient NMEA parser
 
@@ -31,6 +38,13 @@
 // NEO-6M GPS (UART2)
 #define GPS_RX_PIN 16 // ESP32 RX ← GPS TX
 #define GPS_TX_PIN 17 // ESP32 TX → GPS RX (not used, but wired)
+
+// SSD1306 OLED (I2C — default ESP32 I2C bus)
+#define OLED_SDA_PIN 21
+#define OLED_SCL_PIN 22
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+#define OLED_I2C_ADDR 0x3C
 
 // Alert GPIOs
 #define BUZZER_PIN 25
@@ -58,26 +72,27 @@ static const uint8_t NUM_EMERGENCY_CHANNELS = sizeof(EMERGENCY_CHANNELS);
 static const uint32_t EMERGENCY_HOP_GAP_US = 500; // µs between channel hops (non-blocking)
 
 // ─── Duplicate suppression ─────────────────────────────────────────────────
-// Cache of recently-seen (vehicleID, packetID) pairs to ignore re-broadcasts.
 static const uint8_t DEDUP_CACHE_SIZE = 32;
 
 // Drowsy wake-up escalation — 3 stages, increasingly urgent
 static const uint8_t WAKEUP_STAGES = 3;                         // number of escalating pulses
 static const uint32_t WAKEUP_STAGE_ON_MS[3] = {300, 600, 1200}; // buzz on-time per stage
 static const uint32_t WAKEUP_STAGE_OFF_MS[3] = {700, 400, 300}; // pause between stages
-// Total wake-up window ≈ 300+700 + 600+400 + 1200+300 = 3500 ms
-// After the last stage, we wait an extra WAKEUP_GRACE_MS for a cancel command.
 static const uint32_t WAKEUP_GRACE_MS = 1000; // extra grace period after last pulse
 
 // Incapacitation / SOS beacon
 static const uint32_t INCAP_TIMEOUT_MS = 30000;      // 30 s without DRIVER_OK → SOS
 static const uint32_t SOS_BEACON_INTERVAL_MS = 2000; // re-broadcast SOS every 2 s
 
+// OLED display
+static const uint32_t OLED_REFRESH_MS = 250;         // ~4 Hz screen refresh
+static const uint32_t OLED_PAGE_CYCLE_MS = 3000;     // auto-cycle pages every 3 s
+static const uint32_t OLED_ALERT_DISPLAY_MS = 3000;  // show alert overlay for 3 s
+
 // Earth radius in metres (for Haversine / equirectangular)
 static const float EARTH_RADIUS_M = 6371000.0f;
 
 // ─────────────────────────── PACKET STRUCTURES (packed, ≤32 B) ─────────────
-// Normal telemetry packet — 14 bytes (was 11; added vehicleID + packetID)
 struct __attribute__((packed)) NormalPacket
 {
     uint8_t packetType;    // 0
@@ -90,7 +105,6 @@ struct __attribute__((packed)) NormalPacket
 };
 static_assert(sizeof(NormalPacket) <= 32, "NormalPacket exceeds 32-byte NRF limit");
 
-// Emergency packet — 13 bytes (was 10; added vehicleID + packetID)
 struct __attribute__((packed)) EmergencyPacket
 {
     uint8_t packetType; // 1
@@ -103,7 +117,6 @@ struct __attribute__((packed)) EmergencyPacket
 static_assert(sizeof(EmergencyPacket) <= 32, "EmergencyPacket exceeds 32-byte NRF limit");
 
 // ─────────────────────── GENERIC RING BUFFER (lock-free SPSC) ──────────────
-// Single-producer, single-consumer — safe across two FreeRTOS tasks without mutex.
 template <typename T, uint8_t N>
 class RingBuffer
 {
@@ -142,6 +155,9 @@ private:
 // RF
 RF24 radio(NRF_CE_PIN, NRF_CSN_PIN);
 
+// OLED display
+Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+
 // GPS (NeoGPS)
 static NMEAGPS gpsParser;                   // parser instance
 static gps_fix gpsFix;                      // latest fix
@@ -162,31 +178,31 @@ static volatile uint16_t ownSpeed = 0; // km/h × 10
 static volatile uint8_t ownTurn = 0;   // 0=straight
 
 // ─── Debug counters ────────────────────────────────────────────────────────
-static volatile uint32_t dbgTxNormalCount = 0;    // total normal packets sent
-static volatile uint32_t dbgTxEmergencyCount = 0; // total emergency packets sent
-static volatile uint32_t dbgRxRawCount = 0;       // total raw packets received
-static volatile uint32_t dbgRxDupCount = 0;       // duplicates suppressed
-static volatile uint32_t dbgRxOwnCount = 0;       // own packets filtered
-static volatile uint32_t dbgCsmaBusyCount = 0;    // CSMA channel-busy events
-static volatile uint32_t dbgGpsFixCount = 0;      // GPS fix updates
+static volatile uint32_t dbgTxNormalCount = 0;
+static volatile uint32_t dbgTxEmergencyCount = 0;
+static volatile uint32_t dbgRxRawCount = 0;
+static volatile uint32_t dbgRxDupCount = 0;
+static volatile uint32_t dbgRxOwnCount = 0;
+static volatile uint32_t dbgCsmaBusyCount = 0;
+static volatile uint32_t dbgGpsFixCount = 0;
 
 // ─── Packet identification ─────────────────────────────────────────────────
-static uint8_t myVehicleID = 0; // derived from ESP32 MAC at boot
-static uint16_t txPacketID = 0; // auto-incrementing per TX
+static uint8_t myVehicleID = 0;
+static uint16_t txPacketID = 0;
 
 // ─── CSMA backoff state ────────────────────────────────────────────────────
-static uint8_t csmaBackoffAttempt = 0; // current backoff attempt count
-static uint32_t csmaBackoffUntil = 0;  // millis() until which we wait
+static uint8_t csmaBackoffAttempt = 0;
+static uint32_t csmaBackoffUntil = 0;
 
 // ─── Duplicate suppression cache ───────────────────────────────────────────
 struct DedupEntry
 {
     uint8_t vehicleID;
     uint16_t packetID;
-    uint32_t timestamp; // millis() when seen — for expiry
+    uint32_t timestamp;
 };
 static DedupEntry dedupCache[DEDUP_CACHE_SIZE];
-static uint8_t dedupIdx = 0; // circular write index
+static uint8_t dedupIdx = 0;
 
 // Flags (atomic-safe on ESP32 — single-word writes)
 static volatile bool emergencyDrowsy = false;
@@ -199,26 +215,26 @@ static volatile uint32_t alertActiveUntil = 0;
 static volatile uint32_t lastDrowsyTrigger = 0;
 
 // ─── Drowsy wake-up state machine ──────────────────────────────────────────
-// States: 0=IDLE, 1=WAKEUP_ON (buzzer/LED on for current stage),
-//         2=WAKEUP_OFF (pause between stages), 3=GRACE (waiting for cancel),
-//         4=BROADCAST (wake-up failed — send emergency)
-static volatile uint8_t drowsyState = 0;       // 0=IDLE
-static volatile uint8_t drowsyStage = 0;       // current escalation stage (0..2)
-static volatile uint32_t drowsyStateStart = 0; // millis() when current state began
-static volatile bool drowsyCancelFlag = false; // set by Serial listener
+static volatile uint8_t drowsyState = 0;
+static volatile uint8_t drowsyStage = 0;
+static volatile uint32_t drowsyStateStart = 0;
+static volatile bool drowsyCancelFlag = false;
 
 // ─── Incapacitation / SOS state ────────────────────────────────────────────
-// After a collision or unresponsive-drowsy event, a 30 s countdown begins.
-// If the driver does not send DRIVER_OK, we enter SOS mode and repeatedly
-// broadcast the vehicle's GPS location for emergency responders.
-static volatile bool incapTimerActive = false; // countdown running
-static volatile uint32_t incapTimerStart = 0;  // millis() when countdown began
-static volatile bool sosActive = false;        // SOS beacon mode
-static volatile uint32_t lastSosBeacon = 0;    // millis() of last SOS broadcast
-static volatile bool driverOkFlag = false;     // set by Serial when DRIVER_OK received
+static volatile bool incapTimerActive = false;
+static volatile uint32_t incapTimerStart = 0;
+static volatile bool sosActive = false;
+static volatile uint32_t lastSosBeacon = 0;
+static volatile bool driverOkFlag = false;
+
+// ─── OLED display state (written by various tasks, read by OLED task) ──────
+// All fields are volatile for cross-task visibility.
+static volatile char oledAlertText[22] = "";       // alert overlay text (empty = no alert)
+static volatile uint32_t oledAlertStart = 0;       // millis() when alert was triggered
+static volatile float oledLastDist = 0.0f;         // last computed distance to nearby vehicle
+static volatile float oledLastTTC = 999.0f;        // last time-to-collision
 
 // ─────────────────── MATH: EQUIRECTANGULAR DISTANCE (fast) ─────────────────
-// Good enough for distances < 1 km; ~10× faster than full Haversine.
 static float approxDistanceM(float lat1, float lon1, float lat2, float lon2)
 {
     float dLat = radians(lat2 - lat1);
@@ -227,26 +243,22 @@ static float approxDistanceM(float lat1, float lon1, float lat2, float lon2)
 }
 
 // ─────────────────── MATH: TIME-TO-COLLISION ───────────────────────────────
-// closingSpeed in m/s, distance in m.  Returns seconds.  <0 means diverging.
 static float computeTTC(float distance, float closingSpeedMs)
 {
     if (closingSpeedMs <= 0.0f)
-        return 999.0f; // not closing
+        return 999.0f;
     return distance / closingSpeedMs;
 }
 
 // ─────────────────── CSMA: CARRIER SENSE ───────────────────────────────────
-// Returns true if the channel appears free.  Uses testCarrier() which needs
-// the radio in RX mode + ~128 µs settle time.
 static bool isChannelClear()
 {
     radio.startListening();
-    delayMicroseconds(CSMA_CARRIER_SENSE_US); // only µs — not blocking
+    delayMicroseconds(CSMA_CARRIER_SENSE_US);
     return !radio.testCarrier();
 }
 
 // ─────────────────── DUPLICATE SUPPRESSION ─────────────────────────────────
-// Returns true if we have already seen this (vehicleID, packetID) recently.
 static bool isDuplicate(uint8_t vid, uint16_t pid)
 {
     uint32_t now = millis();
@@ -254,10 +266,9 @@ static bool isDuplicate(uint8_t vid, uint16_t pid)
     {
         if (dedupCache[i].vehicleID == vid &&
             dedupCache[i].packetID == pid &&
-            (now - dedupCache[i].timestamp) < 5000) // expire after 5 s
+            (now - dedupCache[i].timestamp) < 5000)
             return true;
     }
-    // Not found — add to cache
     dedupCache[dedupIdx].vehicleID = vid;
     dedupCache[dedupIdx].packetID = pid;
     dedupCache[dedupIdx].timestamp = now;
@@ -266,8 +277,6 @@ static bool isDuplicate(uint8_t vid, uint16_t pid)
 }
 
 // ─────── EMERGENCY MULTI-CHANNEL TRANSMIT ──────────────────────────────────
-// Sends an EmergencyPacket EMERGENCY_RETRANSMITS times, once per channel in
-// EMERGENCY_CHANNELS[].  Bypasses CSMA — emergencies always pre-empt.
 static void sendEmergencyMultiChannel(const EmergencyPacket &pkt)
 {
     for (uint8_t ch = 0; ch < NUM_EMERGENCY_CHANNELS; ch++)
@@ -276,10 +285,9 @@ static void sendEmergencyMultiChannel(const EmergencyPacket &pkt)
         radio.setChannel(EMERGENCY_CHANNELS[ch]);
         bool ok = radio.write(&pkt, sizeof(pkt));
         if (ch < NUM_EMERGENCY_CHANNELS - 1)
-            delayMicroseconds(EMERGENCY_HOP_GAP_US); // tiny gap between hops
+            delayMicroseconds(EMERGENCY_HOP_GAP_US);
     }
     dbgTxEmergencyCount++;
-    // Return to normal channel + RX mode
     radio.setChannel(RF_CHANNEL);
     radio.startListening();
 }
@@ -298,117 +306,104 @@ static void updateAlerts()
 {
     if (millis() >= alertActiveUntil && alertActiveUntil != 0)
     {
-        // Turn off
         digitalWrite(BUZZER_PIN, LOW);
         digitalWrite(LED_RED_PIN, LOW);
         alertActiveUntil = 0;
     }
 }
 
+// ── Helper: set OLED alert overlay text ────────────────────────────────────
+static void setOledAlert(const char *text)
+{
+    strncpy((char *)oledAlertText, text, sizeof(oledAlertText) - 1);
+    ((char *)oledAlertText)[sizeof(oledAlertText) - 1] = '\0';
+    oledAlertStart = millis();
+}
+
 // ──────────── DROWSY WAKE-UP STATE MACHINE (non-blocking) ──────────────────
-// Called every tick from the wake-up task.  Drives the escalating buzzer/LED
-// sequence and, if the driver fails to cancel, sets emergencyDrowsy so the
-// RF TX task broadcasts to nearby vehicles.
 static void updateDrowsyWakeup()
 {
     if (drowsyState == 0)
-        return; // IDLE — nothing to do
+        return;
 
     uint32_t now = millis();
     uint32_t elapsed = now - drowsyStateStart;
 
-    // ── Check for driver cancel at any state ──
     if (drowsyCancelFlag)
     {
         drowsyCancelFlag = false;
         drowsyState = 0;
-        // Silence everything
         digitalWrite(BUZZER_PIN, LOW);
         digitalWrite(LED_RED_PIN, LOW);
         digitalWrite(LED_BLU_PIN, LOW);
-        Serial.println("[V2V] Driver responded — drowsy alert CANCELLED. No broadcast sent.");
+        setOledAlert("DROWSY CANCELLED");
         return;
     }
 
     switch (drowsyState)
     {
-    case 1: // WAKEUP_ON — buzzer + LED on for this stage's duration
+    case 1: // WAKEUP_ON
         if (elapsed >= WAKEUP_STAGE_ON_MS[drowsyStage])
         {
-            // Turn off buzzer/LED, move to pause
             digitalWrite(BUZZER_PIN, LOW);
             digitalWrite(LED_RED_PIN, LOW);
             digitalWrite(LED_BLU_PIN, LOW);
-            drowsyState = 2; // WAKEUP_OFF
+            drowsyState = 2;
             drowsyStateStart = now;
         }
         break;
 
-    case 2: // WAKEUP_OFF — pause between stages
+    case 2: // WAKEUP_OFF
         if (elapsed >= WAKEUP_STAGE_OFF_MS[drowsyStage])
         {
             drowsyStage++;
             if (drowsyStage >= WAKEUP_STAGES)
             {
-                // All stages exhausted — enter grace period
                 drowsyState = 3; // GRACE
                 drowsyStateStart = now;
-                Serial.println("[V2V] Wake-up pulses complete. Waiting for driver response...");
             }
             else
             {
-                // Next escalation stage — turn on with more intensity
-                drowsyState = 1; // WAKEUP_ON
+                drowsyState = 1;
                 drowsyStateStart = now;
                 digitalWrite(BUZZER_PIN, HIGH);
                 digitalWrite(LED_RED_PIN, HIGH);
-                // Stage 2+ adds blue LED for extra visual urgency
                 if (drowsyStage >= 1)
                     digitalWrite(LED_BLU_PIN, HIGH);
-                Serial.print("[V2V] Wake-up stage ");
-                Serial.print(drowsyStage + 1);
-                Serial.print("/");
-                Serial.print(WAKEUP_STAGES);
-                Serial.println(" — ESCALATING");
             }
         }
         break;
 
-    case 3: // GRACE — final window for driver to send CANCEL_DROWSY
+    case 3: // GRACE
         if (elapsed >= WAKEUP_GRACE_MS)
         {
-            // No cancel received — driver is unresponsive
-            drowsyState = 4; // BROADCAST
-            Serial.println("[V2V] Driver unresponsive! Broadcasting emergency to nearby vehicles.");
+            drowsyState = 4;
+            setOledAlert("DRIVER UNRESPONSIVE!");
         }
         break;
 
-    case 4: // BROADCAST — set the flag so RF TX task sends emergency packet
+    case 4: // BROADCAST
         emergencyDrowsy = true;
-        drowsyState = 0; // back to IDLE
+        drowsyState = 0;
         break;
     }
 }
 
-// ─────── Start incapacitation countdown (called after collision / drowsy) ───
+// ─────── Start incapacitation countdown ────────────────────────────────────
 static void startIncapTimer()
 {
     if (!incapTimerActive && !sosActive)
     {
         incapTimerActive = true;
         incapTimerStart = millis();
-        Serial.println("[V2V] ⚠ Incapacitation timer STARTED — send DRIVER_OK within 30 s to cancel.");
     }
 }
 
 // ──────────── INCAPACITATION / SOS STATE MACHINE (non-blocking) ────────────
-// Monitors the 30 s countdown and, once expired, repeatedly broadcasts SOS
-// packets and logs to serial so the laptop can relay to emergency services.
 static void updateIncapSos()
 {
     uint32_t now = millis();
 
-    // ── Driver confirmed OK — cancel everything ──
     if (driverOkFlag)
     {
         driverOkFlag = false;
@@ -417,65 +412,43 @@ static void updateIncapSos()
         digitalWrite(BUZZER_PIN, LOW);
         digitalWrite(LED_RED_PIN, LOW);
         digitalWrite(LED_BLU_PIN, LOW);
-        Serial.println("[V2V] DRIVER_OK received — SOS / incap timer CANCELLED.");
+        setOledAlert("DRIVER OK");
         return;
     }
 
-    // ── Countdown phase ──
     if (incapTimerActive && !sosActive)
     {
         uint32_t elapsed = now - incapTimerStart;
         if (elapsed >= INCAP_TIMEOUT_MS)
         {
-            // Driver did not respond in 30 s — enter SOS mode
             incapTimerActive = false;
             sosActive = true;
-            lastSosBeacon = 0; // force immediate first beacon
-            Serial.println("[V2V] ══════════════════════════════════════");
-            Serial.println("[V2V]  DRIVER INCAPACITATED — SOS MODE ON");
-            Serial.println("[V2V]  Broadcasting location to all nearby");
-            Serial.println("[V2V]  vehicles and emergency responders.");
-            Serial.println("[V2V] ══════════════════════════════════════");
-        }
-        else
-        {
-            // Periodic reminder every 10 s
-            static uint32_t lastReminder = 0;
-            if (now - lastReminder >= 10000)
-            {
-                lastReminder = now;
-                Serial.print("[V2V] Incap countdown: ");
-                Serial.print((INCAP_TIMEOUT_MS - elapsed) / 1000);
-                Serial.println("s remaining. Send DRIVER_OK to cancel.");
-            }
+            lastSosBeacon = 0;
+            setOledAlert("!! SOS MODE ON !!");
         }
     }
 
-    // ── SOS beacon mode — broadcast every SOS_BEACON_INTERVAL_MS ──
     if (sosActive)
     {
         if (now - lastSosBeacon >= SOS_BEACON_INTERVAL_MS)
         {
             lastSosBeacon = now;
 
-            // Build SOS emergency packet (eventCode 3)
             EmergencyPacket pkt;
             pkt.packetType = 1;
             pkt.vehicleID = myVehicleID;
             pkt.packetID = txPacketID++;
-            pkt.eventCode = 3; // SOS — driver incapacitated
+            pkt.eventCode = 3;
             pkt.latitude = ownLat;
             pkt.longitude = ownLon;
 
-            // Multi-channel broadcast — bypass CSMA
             sendEmergencyMultiChannel(pkt);
 
-            // Persistent alert — keep buzzer + LEDs on
             digitalWrite(BUZZER_PIN, HIGH);
             digitalWrite(LED_RED_PIN, HIGH);
             digitalWrite(LED_BLU_PIN, HIGH);
 
-            // Log to serial for emergency-responder relay
+            // Emergency-responder log — kept on Serial for laptop relay
             Serial.println("========== SOS BEACON ==========");
             Serial.println("EVENT: DRIVER_INCAPACITATED");
             Serial.print("LAT: ");
@@ -491,8 +464,7 @@ static void updateIncapSos()
 }
 
 // ────────────────── SERIAL LOGGING FOR EMERGENCY RESPONDERS ────────────────
-// When a collision is detected, log GPS coordinates + timestamp to Serial
-// so the connected laptop can capture them for emergency services (no cloud).
+// Kept on Serial — these are critical logs the laptop captures for emergency services.
 static void logCollisionToSerial(float lat, float lon, uint8_t eventCode)
 {
     Serial.println("========== EMERGENCY EVENT ==========");
@@ -526,9 +498,6 @@ static void logCollisionToSerial(float lat, float lon, uint8_t eventCode)
  *  CORE 0 TASKS — GPS & Serial Listener
  *==========================================================================*/
 
-// ── Task: GPS UART Parsing ────────────────────────────────────────────────
-// Reads NMEA sentences from NEO-6M at 9600 baud.  NeoGPS handles incremental
-// parse so we never block.
 void taskGPS(void *pvParameters)
 {
     (void)pvParameters;
@@ -541,8 +510,6 @@ void taskGPS(void *pvParameters)
         while (gpsParser.available(gpsSerial))
         {
             gpsFix = gpsParser.read();
-            bool locUpdated = false;
-            bool spdUpdated = false;
 
             if (gpsFix.valid.location)
             {
@@ -552,7 +519,6 @@ void taskGPS(void *pvParameters)
             }
             if (gpsFix.valid.speed)
             {
-                // NeoGPS gives speed in km/h as float; store × 10 for 0.1 res
                 ownSpeed = (uint16_t)(gpsFix.speed_kph() * 10.0f);
                 spdUpdated = true;
             }
@@ -564,15 +530,18 @@ void taskGPS(void *pvParameters)
                 lastGpsLog = now;
                 dbgGpsFixCount++;
             }
+
+            uint32_t now = millis();
+            if (now - lastGpsLog >= 2000)
+            {
+                lastGpsLog = now;
+                dbgGpsFixCount++;
+            }
         }
-        vTaskDelay(pdMS_TO_TICKS(10)); // yield — not a blocking delay
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-// ── Task: Serial Listener (Laptop → ESP32 for DROWSY_ALERT) ──────────────
-// Non-blocking: polls Serial.available() on a short interval.
-// Reads accumulated chars into a small line buffer; when '\n' is seen,
-// checks for the "DROWSY_ALERT" keyword.
 void taskSerialListener(void *pvParameters)
 {
     (void)pvParameters;
@@ -598,31 +567,28 @@ void taskSerialListener(void *pvParameters)
             {
                 lineBuf[lineIdx] = '\0';
 
-                // ── Check for DRIVER_OK (driver confirmed conscious) ──
                 if (lineIdx > 0 && strstr(lineBuf, "DRIVER_OK") != nullptr)
                 {
-                    driverOkFlag = true;     // cancels incap timer / SOS
-                    drowsyCancelFlag = true; // also cancels any drowsy wake-up
+                    driverOkFlag = true;
+                    drowsyCancelFlag = true;
                 }
-                // ── Check for CANCEL_DROWSY (driver confirmed awake) ──
                 else if (lineIdx > 0 && strstr(lineBuf, "CANCEL_DROWSY") != nullptr)
                 {
                     drowsyCancelFlag = true;
                 }
-                // ── Check for DROWSY_ALERT ──
                 else if (lineIdx > 0 && strstr(lineBuf, "DROWSY_ALERT") != nullptr)
                 {
                     if (now - lastDrowsyTrigger > DROWSY_ALERT_REARM_MS)
                     {
                         lastDrowsyTrigger = now;
-                        // Start wake-up escalation — do NOT broadcast yet
+                        // Buzzer ON immediately — driver hears it right away
                         drowsyStage = 0;
                         drowsyState = 1; // WAKEUP_ON
                         drowsyStateStart = now;
                         drowsyCancelFlag = false;
-                        // Turn on buzzer + red LED for first (gentlest) stage
                         digitalWrite(BUZZER_PIN, HIGH);
                         digitalWrite(LED_RED_PIN, HIGH);
+                        setOledAlert("!! DROWSY !!");
                     }
                 }
                 lineIdx = 0;
@@ -639,22 +605,17 @@ void taskSerialListener(void *pvParameters)
  *  CORE 1 TASKS — RF TX/RX & Risk Assessment
  *==========================================================================*/
 
-// ── Task: RF Transmit ─────────────────────────────────────────────────────
-// Broadcasts NormalPacket at ~1 Hz (+ random jitter).  Emergency packets
-// pre-empt immediately, bypass CSMA, and hop across multiple channels.
 void taskRFTransmit(void *pvParameters)
 {
     (void)pvParameters;
     uint32_t lastTx = 0;
-    uint32_t txJitter = random(0, TX_JITTER_MAX_MS); // initial jitter
+    uint32_t txJitter = random(0, TX_JITTER_MAX_MS);
 
     for (;;)
     {
         uint32_t now = millis();
 
-        // ══════════════════════════════════════════════════════════════
         // PRIORITY 1: Emergency packets — bypass CSMA, multi-channel
-        // ══════════════════════════════════════════════════════════════
         if (emergencyDrowsy)
         {
             emergencyDrowsy = false;
@@ -662,17 +623,14 @@ void taskRFTransmit(void *pvParameters)
             pkt.packetType = 1;
             pkt.vehicleID = myVehicleID;
             pkt.packetID = txPacketID++;
-            pkt.eventCode = 2; // Drowsy
+            pkt.eventCode = 2;
             pkt.latitude = ownLat;
             pkt.longitude = ownLon;
 
-            // Transmit across all emergency channels (no carrier check)
             sendEmergencyMultiChannel(pkt);
-
             logCollisionToSerial(pkt.latitude, pkt.longitude, pkt.eventCode);
-            fireAlert(); // local alert too
-
-            // Driver was unresponsive during wake-up → start incap countdown
+            fireAlert();
+            setOledAlert("TX DROWSY EMERG");
             startIncapTimer();
         }
 
@@ -683,38 +641,30 @@ void taskRFTransmit(void *pvParameters)
             pkt.packetType = 1;
             pkt.vehicleID = myVehicleID;
             pkt.packetID = txPacketID++;
-            pkt.eventCode = 1; // Collision
+            pkt.eventCode = 1;
             pkt.latitude = ownLat;
             pkt.longitude = ownLon;
 
-            // Transmit across all emergency channels (no carrier check)
             sendEmergencyMultiChannel(pkt);
-
             logCollisionToSerial(pkt.latitude, pkt.longitude, pkt.eventCode);
             fireAlert();
-
-            // Collision detected → start incap countdown
+            setOledAlert("TX COLLISION!");
             startIncapTimer();
         }
 
-        // ══════════════════════════════════════════════════════════════
         // PRIORITY 2: Normal 1 Hz telemetry — with CSMA + jitter
-        // ══════════════════════════════════════════════════════════════
         if (now - lastTx >= NORMAL_TX_INTERVAL_MS + txJitter)
         {
-            // ── CSMA: check if in backoff ──
             if (now < csmaBackoffUntil)
             {
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
 
-            // ── CSMA: carrier sense ──
             if (isChannelClear())
             {
-                // Channel free — transmit
                 lastTx = now;
-                txJitter = random(0, TX_JITTER_MAX_MS); // new jitter for next cycle
+                txJitter = random(0, TX_JITTER_MAX_MS);
                 csmaBackoffAttempt = 0;
 
                 NormalPacket pkt;
@@ -734,19 +684,16 @@ void taskRFTransmit(void *pvParameters)
             else
             {
                 // Channel busy — exponential backoff
-                dbgCsmaBusyCount++;
                 csmaBackoffAttempt++;
 
                 if (csmaBackoffAttempt >= CSMA_MAX_BACKOFF_TRIES)
                 {
-                    // Give up — skip this TX cycle, reset for next
                     lastTx = now;
                     txJitter = random(0, TX_JITTER_MAX_MS);
                     csmaBackoffAttempt = 0;
                 }
                 else
                 {
-                    // backoff = random(1..10) * attempt  (in ms)
                     uint32_t bo = (uint32_t)random(1, 11) * csmaBackoffAttempt;
                     csmaBackoffUntil = now + bo;
                 }
@@ -757,41 +704,26 @@ void taskRFTransmit(void *pvParameters)
     }
 }
 
-// ── Task: RF Receive ──────────────────────────────────────────────────────
-// Non-blocking poll; pushes raw 32-byte payloads into ring buffer.
-// Periodically hops to emergency channels to catch multi-channel broadcasts.
 void taskRFReceive(void *pvParameters)
 {
     (void)pvParameters;
-    uint8_t rxChIdx = 0;                   // index into EMERGENCY_CHANNELS for scanning
-    uint32_t lastChHop = 0;                // millis() of last channel hop
-    const uint32_t RX_HOP_DWELL_MS = 50;   // dwell 50 ms on each emergency channel
-    const uint32_t RX_HOME_DWELL_MS = 200; // stay on home channel longer
+    uint8_t rxChIdx = 0;
+    uint32_t lastChHop = 0;
+    const uint32_t RX_HOP_DWELL_MS = 50;
+    const uint32_t RX_HOME_DWELL_MS = 200;
     bool onHomeChannel = true;
 
     for (;;)
     {
-        // Read all available packets on current channel
         while (radio.available())
         {
             RawPacket pkt;
             radio.read(&pkt.data, sizeof(pkt.data));
             rxRingBuffer.push(pkt);
             dbgRxRawCount++;
-
-            uint8_t pType = pkt.data[0];
-            uint8_t curCh = onHomeChannel ? RF_CHANNEL : EMERGENCY_CHANNELS[rxChIdx];
-            Serial.print("[RX] Raw packet on ch=");
-            Serial.print(curCh);
-            Serial.print(" type=");
-            Serial.print(pType);
-            Serial.print(" rxTotal=");
-            Serial.print(dbgRxRawCount);
-            Serial.print(" bufUsed=");
-            Serial.println(rxRingBuffer.count());
         }
 
-        // ── Channel hopping for emergency reception ──
+        // Channel hopping for emergency reception
         uint32_t now = millis();
         uint32_t dwellTime = onHomeChannel ? RX_HOME_DWELL_MS : RX_HOP_DWELL_MS;
         if (now - lastChHop >= dwellTime)
@@ -799,7 +731,6 @@ void taskRFReceive(void *pvParameters)
             lastChHop = now;
             if (onHomeChannel)
             {
-                // Hop to first emergency channel
                 rxChIdx = 0;
                 onHomeChannel = false;
                 radio.stopListening();
@@ -811,7 +742,6 @@ void taskRFReceive(void *pvParameters)
                 rxChIdx++;
                 if (rxChIdx >= NUM_EMERGENCY_CHANNELS)
                 {
-                    // Return to home channel
                     onHomeChannel = true;
                     radio.stopListening();
                     radio.setChannel(RF_CHANNEL);
@@ -830,14 +760,10 @@ void taskRFReceive(void *pvParameters)
     }
 }
 
-// ── Task: Risk Assessment ─────────────────────────────────────────────────
-// Pops packets from ring buffer, decodes, deduplicates, computes distance
-// & TTC, fires alerts when thresholds are breached.
 void taskRiskAssessment(void *pvParameters)
 {
     (void)pvParameters;
 
-    // Store last-known positions for TTC (closing speed) calculation
     static float lastKnownDist = 999.0f;
     static uint32_t lastDistTime = 0;
 
@@ -851,37 +777,27 @@ void taskRiskAssessment(void *pvParameters)
 
             if (packetType == 0)
             {
-                // ── Normal Packet ──
                 NormalPacket pkt;
                 memcpy(&pkt, raw, sizeof(NormalPacket));
 
-                // Ignore our own packets
                 if (pkt.vehicleID == myVehicleID)
                 {
                     dbgRxOwnCount++;
                     continue;
                 }
 
-                // Duplicate suppression
                 if (isDuplicate(pkt.vehicleID, pkt.packetID))
-                {
-                    dbgRxDupCount++;
-                    Serial.print("[RISK] Duplicate normal pkt suppressed: vID=");
-                    Serial.print(pkt.vehicleID);
-                    Serial.print(" pktID=");
-                    Serial.println(pkt.packetID);
                     continue;
                 }
 
                 float dist = approxDistanceM(ownLat, ownLon, pkt.latitude, pkt.longitude);
 
-                // Closing speed estimate (Δdist / Δtime)
                 uint32_t now = millis();
                 float closingSpeedMs = 0.0f;
                 if (lastDistTime > 0 && now > lastDistTime)
                 {
                     float dt = (now - lastDistTime) / 1000.0f;
-                    closingSpeedMs = (lastKnownDist - dist) / dt; // +ve = closing
+                    closingSpeedMs = (lastKnownDist - dist) / dt;
                 }
                 lastKnownDist = dist;
                 lastDistTime = now;
@@ -909,96 +825,278 @@ void taskRiskAssessment(void *pvParameters)
                 Serial.print(ttc, 1);
                 Serial.println("s");
 
-                // ── Threshold check ──
+                // Update OLED display state
+                oledLastDist = dist;
+                oledLastTTC = ttc;
+
                 if (dist < ALERT_DISTANCE_M || ttc < ALERT_TTC_S)
                 {
                     fireAlert();
+                    setOledAlert("PROXIMITY ALERT!");
 
-                    Serial.print("[RISK] *** PROXIMITY ALERT! dist=");
-                    Serial.print(dist, 1);
-                    Serial.print("m  TTC=");
-                    Serial.print(ttc, 1);
-                    Serial.print("s  vID=");
-                    Serial.print(pkt.vehicleID);
-                    Serial.print("  pktID=");
-                    Serial.println(pkt.packetID);
-
-                    // If TTC is critically low, treat as imminent collision
                     if (ttc < 1.5f && dist < 30.0f)
                     {
                         Serial.println("[RISK] !!! IMMINENT COLLISION — triggering emergency");
                         emergencyCollision = true;
                         logCollisionToSerial(ownLat, ownLon, 1);
+                        setOledAlert("!! COLLISION !!");
                     }
                 }
             }
             else if (packetType == 1)
             {
-                // ── Emergency Packet ──
                 EmergencyPacket pkt;
                 memcpy(&pkt, raw, sizeof(EmergencyPacket));
 
-                // Ignore our own packets
                 if (pkt.vehicleID == myVehicleID)
                 {
                     dbgRxOwnCount++;
                     continue;
                 }
 
-                // Duplicate suppression — critical for multi-channel rebroadcasts
                 if (isDuplicate(pkt.vehicleID, pkt.packetID))
                 {
                     dbgRxDupCount++;
-                    Serial.print("[RISK] Duplicate emergency pkt suppressed: vID=");
-                    Serial.print(pkt.vehicleID);
-                    Serial.print(" pktID=");
-                    Serial.println(pkt.packetID);
                     continue;
                 }
 
+                // Buzzer beeps immediately for any incoming emergency
                 fireAlert();
 
-                const char *evtName;
                 switch (pkt.eventCode)
                 {
                 case 1:
-                    evtName = "COLLISION";
+                    setOledAlert("RX: COLLISION!");
                     break;
                 case 2:
-                    evtName = "DROWSY";
+                    // Drowsy alert from another vehicle — immediate buzzer
+                    setOledAlert("RX: DROWSY!");
                     break;
                 case 3:
-                    evtName = "SOS";
+                    setOledAlert("RX: SOS BEACON!");
                     break;
                 default:
-                    evtName = "UNKNOWN";
+                    setOledAlert("RX: EMERGENCY!");
                     break;
                 }
-                Serial.print("[RISK] *** EMERGENCY from vID=");
-                Serial.print(pkt.vehicleID);
-                Serial.print(" pktID=");
-                Serial.print(pkt.packetID);
-                Serial.print(" Event=");
-                Serial.print(evtName);
-                Serial.print(" lat=");
-                Serial.print(pkt.latitude, 6);
-                Serial.print(" lon=");
-                Serial.println(pkt.longitude, 6);
 
-                if (pkt.eventCode == 3)
-                {
-                    Serial.println("[RISK] ⚠ Nearby vehicle driver is INCAPACITATED — SOS beacon!");
-                }
-
-                // Log for emergency responders on the connected laptop
                 logCollisionToSerial(pkt.latitude, pkt.longitude, pkt.eventCode);
             }
         }
 
-        // Update alert GPIOs (non-blocking off-timer)
         updateAlerts();
-
         vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/*============================================================================
+ *  OLED DISPLAY TASK
+ *==========================================================================*/
+
+// Renders system status on the 128×64 OLED.  Cycles through pages automatically.
+// When an alert is active, shows a full-screen alert overlay instead.
+void taskOLED(void *pvParameters)
+{
+    (void)pvParameters;
+
+    uint8_t currentPage = 0;
+    const uint8_t NUM_PAGES = 3;
+    uint32_t lastPageSwitch = millis();
+    uint32_t lastRefresh = 0;
+
+    for (;;)
+    {
+        uint32_t now = millis();
+
+        if (now - lastRefresh < OLED_REFRESH_MS)
+        {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        lastRefresh = now;
+
+        oled.clearDisplay();
+        oled.setTextColor(SSD1306_WHITE);
+
+        // ── Check for alert overlay ──
+        bool alertActive = (oledAlertText[0] != '\0') &&
+                           (now - oledAlertStart < OLED_ALERT_DISPLAY_MS);
+
+        if (alertActive)
+        {
+            // Full-screen alert with large text
+            oled.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SSD1306_WHITE);
+            oled.drawRect(2, 2, OLED_WIDTH - 4, OLED_HEIGHT - 4, SSD1306_WHITE);
+
+            oled.setTextSize(1);
+            oled.setCursor(30, 8);
+            oled.print("!! ALERT !!");
+
+            oled.setTextSize(1);
+            // Centre the alert text
+            int16_t textLen = strlen((const char *)oledAlertText);
+            int16_t xPos = (OLED_WIDTH - textLen * 6) / 2;
+            if (xPos < 4) xPos = 4;
+            oled.setCursor(xPos, 28);
+            oled.print((const char *)oledAlertText);
+
+            // Show distance if available
+            if (oledLastDist < 500.0f)
+            {
+                char buf[22];
+                snprintf(buf, sizeof(buf), "Dist:%.0fm TTC:%.1fs", (double)oledLastDist, (double)oledLastTTC);
+                textLen = strlen(buf);
+                xPos = (OLED_WIDTH - textLen * 6) / 2;
+                if (xPos < 4) xPos = 4;
+                oled.setCursor(xPos, 44);
+                oled.print(buf);
+            }
+
+            // Clear alert text when expired
+            if (now - oledAlertStart >= OLED_ALERT_DISPLAY_MS)
+            {
+                ((char *)oledAlertText)[0] = '\0';
+            }
+        }
+        else
+        {
+            // ── Normal page display ──
+            // Auto-cycle pages
+            if (now - lastPageSwitch >= OLED_PAGE_CYCLE_MS)
+            {
+                lastPageSwitch = now;
+                currentPage = (currentPage + 1) % NUM_PAGES;
+            }
+
+            // Header bar (always shown)
+            oled.setTextSize(1);
+            oled.setCursor(0, 0);
+            oled.print("V2V ID:");
+            oled.print(myVehicleID);
+
+            // GPS fix indicator
+            oled.setCursor(80, 0);
+            if (ownLat != 0.0f || ownLon != 0.0f)
+                oled.print("GPS:OK");
+            else
+                oled.print("GPS:--");
+
+            oled.drawLine(0, 10, OLED_WIDTH, 10, SSD1306_WHITE);
+
+            switch (currentPage)
+            {
+            case 0: // ── Page: Status Overview ──
+            {
+                oled.setCursor(0, 13);
+                oled.print("Spd: ");
+                oled.print(ownSpeed / 10.0f, 1);
+                oled.print(" km/h");
+
+                oled.setCursor(0, 23);
+                oled.print("Lat: ");
+                oled.print(ownLat, 5);
+
+                oled.setCursor(0, 33);
+                oled.print("Lon: ");
+                oled.print(ownLon, 5);
+
+                oled.setCursor(0, 43);
+                oled.print("Up: ");
+                oled.print(now / 1000);
+                oled.print("s  Heap:");
+                oled.print(ESP.getFreeHeap() / 1024);
+                oled.print("k");
+
+                // Status line
+                oled.setCursor(0, 55);
+                if (sosActive)
+                    oled.print("!! SOS ACTIVE !!");
+                else if (incapTimerActive)
+                    oled.print("INCAP TIMER ON");
+                else if (drowsyState > 0)
+                    oled.print("DROWSY WAKEUP...");
+                else
+                    oled.print("System OK");
+
+                // Page indicator
+                oled.setCursor(110, 55);
+                oled.print("1/3");
+                break;
+            }
+
+            case 1: // ── Page: RF Statistics ──
+            {
+                oled.setCursor(0, 13);
+                oled.print("TX norm: ");
+                oled.print(dbgTxNormalCount);
+
+                oled.setCursor(0, 23);
+                oled.print("TX emrg: ");
+                oled.print(dbgTxEmergencyCount);
+
+                oled.setCursor(0, 33);
+                oled.print("RX raw:  ");
+                oled.print(dbgRxRawCount);
+
+                oled.setCursor(0, 43);
+                oled.print("RX dup:");
+                oled.print(dbgRxDupCount);
+                oled.print(" own:");
+                oled.print(dbgRxOwnCount);
+
+                oled.setCursor(0, 53);
+                oled.print("CSMA busy: ");
+                oled.print(dbgCsmaBusyCount);
+
+                oled.setCursor(110, 55);
+                oled.print("2/3");
+                break;
+            }
+
+            case 2: // ── Page: Nearby Vehicles ──
+            {
+                oled.setCursor(0, 13);
+                oled.print("Nearest dist:");
+
+                oled.setCursor(0, 23);
+                if (oledLastDist < 500.0f && oledLastDist > 0.01f)
+                {
+                    oled.setTextSize(2);
+                    oled.print(oledLastDist, 0);
+                    oled.setTextSize(1);
+                    oled.print(" m");
+                }
+                else
+                {
+                    oled.print("-- no vehicle --");
+                }
+
+                oled.setCursor(0, 43);
+                oled.print("TTC: ");
+                if (oledLastTTC < 100.0f)
+                {
+                    oled.print(oledLastTTC, 1);
+                    oled.print("s");
+                }
+                else
+                {
+                    oled.print("safe");
+                }
+
+                oled.setCursor(0, 53);
+                oled.print("Buf:");
+                oled.print(rxRingBuffer.count());
+                oled.print(" GPS fix:");
+                oled.print(dbgGpsFixCount);
+
+                oled.setCursor(110, 55);
+                oled.print("3/3");
+                break;
+            }
+            }
+        }
+
+        oled.display();
     }
 }
 
@@ -1007,34 +1105,18 @@ void taskRiskAssessment(void *pvParameters)
  *==========================================================================*/
 void setup()
 {
-    // ── Serial (USB — laptop comms + debug) ──
+    // ── Serial (USB — reserved for Python script commands) ──
     Serial.begin(115200);
     while (!Serial)
     {
         ;
     }
-    Serial.println("\n[SYS] ========================================");
-    Serial.println("[SYS]  Vehicle-to-Vehicle Safety System v2.0");
-    Serial.println("[SYS]  VERBOSE DEBUG MODE — all values printed");
-    Serial.println("[SYS]  No-Cloud | CSMA/CA | Multi-Channel");
-    Serial.println("[SYS] ========================================");
-    Serial.print("[SYS] Free heap: ");
-    Serial.print(ESP.getFreeHeap());
-    Serial.println(" bytes");
-    Serial.print("[SYS] CPU freq: ");
-    Serial.print(ESP.getCpuFreqMHz());
-    Serial.println(" MHz");
-    Serial.print("[SYS] Chip model: ");
-    Serial.println(ESP.getChipModel());
 
-    // ── Vehicle ID from ESP32 MAC (unique per chip) ──
-    // Use lowest byte of the base MAC — simple and unique enough for local RF
+    // ── Vehicle ID from ESP32 MAC ──
     uint8_t mac[6];
     esp_efuse_mac_get_default(mac);
-    myVehicleID = mac[5];                   // last byte is the most unique
-    randomSeed(mac[4] ^ (millis() & 0xFF)); // seed RNG with MAC + boot time
-    Serial.print("[V2V] Vehicle ID: ");
-    Serial.println(myVehicleID);
+    myVehicleID = mac[5];
+    randomSeed(mac[4] ^ (millis() & 0xFF));
 
     // ── Initialise dedup cache ──
     memset(dedupCache, 0, sizeof(dedupCache));
@@ -1049,17 +1131,43 @@ void setup()
     digitalWrite(LED_GRN_PIN, LOW);
     digitalWrite(LED_BLU_PIN, LOW);
 
-    // Quick LED self-test (non-blocking: just a fast blink)
+    // Quick LED self-test
     digitalWrite(LED_GRN_PIN, HIGH);
-    // We allow a tiny startup delay here since setup() runs once before the scheduler
-    // In production, even this could be removed.
+
+    // ── OLED Display ──
+    Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+    if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR))
+    {
+        // OLED failed — blink blue to indicate, but continue (non-fatal)
+        for (int i = 0; i < 6; i++)
+        {
+            digitalWrite(LED_BLU_PIN, !digitalRead(LED_BLU_PIN));
+            delay(200);
+        }
+    }
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setCursor(10, 8);
+    oled.println("V2V Safety System");
+    oled.setCursor(10, 24);
+    oled.print("ID: ");
+    oled.println(myVehicleID);
+    oled.setCursor(10, 40);
+    oled.println("Booting...");
+    oled.display();
 
     // ── NRF24L01 ──
     if (!radio.begin())
     {
-        Serial.println("[V2V] ERROR: NRF24L01 not detected! Check wiring.");
-        // Blink red forever (non-blocking in the main loop would be better,
-        // but we halt here because the system is non-functional without radio)
+        // Show error on OLED
+        oled.clearDisplay();
+        oled.setCursor(0, 20);
+        oled.setTextSize(1);
+        oled.println("NRF24L01 ERROR!");
+        oled.println("Check wiring.");
+        oled.display();
+
         while (true)
         {
             digitalWrite(LED_RED_PIN, !digitalRead(LED_RED_PIN));
@@ -1070,47 +1178,40 @@ void setup()
     radio.setPALevel(RF24_PA_MAX);
     radio.setDataRate(RF24_2MBPS);
     radio.setPayloadSize(32);
-    radio.setAutoAck(false); // broadcast mode — no ACKs
+    radio.setAutoAck(false);
     radio.openWritingPipe(RF_PIPE_ADDR);
     radio.openReadingPipe(1, RF_PIPE_ADDR);
     radio.startListening();
-    Serial.println("[SYS] NRF24L01 initialised OK");
-    Serial.print("[SYS]   Home channel: ");
-    Serial.println(RF_CHANNEL);
-    Serial.print("[SYS]   PA level: MAX | Data rate: 2Mbps | Payload: 32B");
-    Serial.println();
-    Serial.print("[SYS]   Emergency channels: ");
-    for (uint8_t i = 0; i < NUM_EMERGENCY_CHANNELS; i++)
-    {
-        Serial.print(EMERGENCY_CHANNELS[i]);
-        if (i < NUM_EMERGENCY_CHANNELS - 1)
-            Serial.print(", ");
-    }
-    Serial.println();
-    Serial.print("[SYS]   NormalPacket size: ");
-    Serial.print(sizeof(NormalPacket));
-    Serial.print("B  EmergencyPacket size: ");
-    Serial.print(sizeof(EmergencyPacket));
-    Serial.println("B");
+
+    // Update OLED boot screen
+    oled.clearDisplay();
+    oled.setCursor(10, 8);
+    oled.println("V2V Safety System");
+    oled.setCursor(10, 24);
+    oled.print("ID: ");
+    oled.print(myVehicleID);
+    oled.print("  RF:OK");
+    oled.setCursor(10, 40);
+    oled.println("Launching tasks...");
+    oled.display();
 
     // ── FreeRTOS Task Creation ──
     // Core 0: GPS + Serial Listener
     xTaskCreatePinnedToCore(
-        taskGPS,     // function
-        "GPS_Parse", // name
-        4096,        // stack (bytes)
-        NULL,        // params
-        2,           // priority (higher = more urgent)
-        NULL,        // handle
-        0            // core 0
-    );
+        taskGPS,
+        "GPS_Parse",
+        4096,
+        NULL,
+        2,
+        NULL,
+        0);
 
     xTaskCreatePinnedToCore(
         taskSerialListener,
         "Serial_Listen",
         4096,
         NULL,
-        1, // lower priority than GPS
+        1,
         NULL,
         0);
 
@@ -1120,7 +1221,7 @@ void setup()
         "RF_TX",
         4096,
         NULL,
-        3, // highest priority — emergency TX must pre-empt
+        3,
         NULL,
         1);
 
@@ -1129,7 +1230,7 @@ void setup()
         "RF_RX",
         4096,
         NULL,
-        3, // equal to TX
+        3,
         NULL,
         1);
 
@@ -1142,60 +1243,63 @@ void setup()
         NULL,
         1);
 
-    // Drowsy wake-up state machine — runs on Core 1 alongside other RF tasks
+    // Drowsy wake-up state machine — Core 1
     xTaskCreatePinnedToCore(
         [](void *)
         {
             for (;;)
             {
                 updateDrowsyWakeup();
-                vTaskDelay(pdMS_TO_TICKS(50)); // 20 Hz update — smooth escalation
+                vTaskDelay(pdMS_TO_TICKS(50));
             }
         },
         "Drowsy_Wake",
         2048,
         NULL,
-        2, // same priority as risk assessment
+        2,
         NULL,
-        1 // core 1
-    );
+        1);
 
-    // Incapacitation / SOS beacon task — monitors 30 s countdown + SOS broadcast
+    // Incapacitation / SOS beacon — Core 1
     xTaskCreatePinnedToCore(
         [](void *)
         {
             for (;;)
             {
                 updateIncapSos();
-                vTaskDelay(pdMS_TO_TICKS(100)); // 10 Hz — sufficient for 2 s beacon
+                vTaskDelay(pdMS_TO_TICKS(100));
             }
         },
         "Incap_SOS",
         2048,
         NULL,
-        3, // high priority — SOS must not be starved
+        3,
         NULL,
-        1 // core 1
-    );
+        1);
 
-    Serial.println("[SYS] All FreeRTOS tasks launched. System active.");
-    Serial.println("[SYS] ── Debug tags: [GPS] [TX] [RX] [CSMA] [RISK] [SOS] [DROWSY] [CMD] [SYS] ──");
+    // OLED display task — Core 0 (I2C runs on same core as GPS/Serial)
+    xTaskCreatePinnedToCore(
+        taskOLED,
+        "OLED_Display",
+        4096,
+        NULL,
+        1, // low priority — display is not time-critical
+        NULL,
+        0);
+
     digitalWrite(LED_GRN_PIN, LOW); // end self-test blink
 }
 
 // Arduino loop() is essentially idle — all real work is in FreeRTOS tasks.
-// We use it for heartbeat LED + periodic debug status dump.
 void loop()
 {
     static uint32_t lastHeartbeat = 0;
     static uint32_t lastStatusDump = 0;
     uint32_t now = millis();
 
-    // ── Heartbeat blink ──
     if (now - lastHeartbeat >= 2000)
     {
         lastHeartbeat = now;
-        // Brief green blink = system alive
         digitalWrite(LED_GRN_PIN, HIGH);
     }
     if (now - lastHeartbeat >= 100 && digitalRead(LED_GRN_PIN))
